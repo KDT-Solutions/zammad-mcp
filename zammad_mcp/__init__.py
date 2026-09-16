@@ -598,14 +598,29 @@ def main():
                 "aus Sicherheitsgruenden kein Start ohne Token."
             )
         import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
 
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8000"))
 
         app = mcp.streamable_http_app()
         secured_app = BearerAuthMiddleware(app, MCP_AUTH_TOKEN)
+        # CORS aussen um die Auth-Middleware: Browser-basierte MCP-Clients (z.B.
+        # Claude.ai) rufen den Endpoint per Cross-Origin-JS-Fetch auf. Ohne CORS-
+        # Header blockt der Browser die Antwort, bevor der Client sie ueberhaupt
+        # sieht - das sieht dann wie "Server nicht erreichbar" aus, obwohl der
+        # Server laeuft. Preflight-OPTIONS-Requests (ohne Authorization-Header)
+        # werden von CORSMiddleware direkt beantwortet, bevor sie die Bearer-
+        # Pruefung erreichen.
+        cors_app = CORSMiddleware(
+            secured_app,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["mcp-session-id"],
+        )
 
-        uvicorn.run(secured_app, host=host, port=port, log_level="info")
+        uvicorn.run(cors_app, host=host, port=port, log_level="info")
     else:
         mcp.run(transport="stdio")
 
