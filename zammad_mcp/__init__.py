@@ -34,15 +34,6 @@ ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
 # MCP_HOST=0.0.0.0 (Cloud-Betrieb) bleibt der Schutz aus - die eigentliche
 # Absicherung uebernimmt ohnehin MCP_AUTH_TOKEN/BearerAuthMiddleware.
 #
-# stateless_http=True: Der Cloud-/HTTP-Betrieb laeuft zustandslos statt mit
-# persistenter Session-ID. Grund: im zustandsbehafteten Modus (Default) kam es
-# bei praktisch jedem Reconnect des Claude-Connectors zu einem 400 Bad Request
-# auf den ersten initialize-Request (die frisch erzeugte Session wurde sofort
-# wieder verworfen, "Terminating session: ..."), was sich als wiederholte
-# Verbindungsabbrueche/"session expired" bemerkbar machte. Da dieser Server
-# keine serverseitig initiierten Push-Nachrichten ueber eine lange Sitzung
-# braucht (reine Request/Response-Tool-Aufrufe), behebt der zustandslose Modus
-# das Problem vollstaendig, ohne Funktionalitaet zu verlieren.
 # json_response=True: einfache application/json-Antworten statt SSE-Stream
 # (text/event-stream). Fuer reine Request/Response-Tool-Aufrufe ohne Server-
 # Push ist das ausreichend und robuster gegenueber Reverse-Proxies - eine
@@ -50,10 +41,16 @@ ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
 # ein SSE-Stream bei ungluecklicher Proxy-Konfiguration (Puffering, offene
 # Verbindung) als Haenger/Timeout beim Client ankommen kann, obwohl der Server
 # die Antwort laengst korrekt verarbeitet hat.
+#
+# stateless_http=False (Standard, spec-konform): ein Versuch mit
+# stateless_http=True lief serverseitig sauber (per Logs bestaetigt), aber der
+# Claude-Connector kam mit den fehlenden Session-IDs nicht zurecht und meldete
+# weiterhin Timeouts, obwohl der Server laengst geantwortet hatte. Mit echten
+# Session-IDs (stateful) UND json_response=True liefen in Tests 5
+# aufeinanderfolgende Reconnect-Zyklen sauber durch.
 mcp = FastMCP(
     "Zammad",
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
-    stateless_http=True,
     json_response=True,
 )
 
