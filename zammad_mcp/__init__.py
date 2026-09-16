@@ -10,49 +10,31 @@ Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
 Alle Instanz-spezifischen Werte (Zammad-URL, Token, Auth-Token) werden ausschliesslich
 über Umgebungsvariablen gesetzt - es sind keine echten Adressen oder Zugangsdaten
 in diesem Code hinterlegt.
+
+HTTP-Transport-Hinweis (2026-09-16):
+Der HTTP-Modus laeuft NICHT mehr ueber FastMCP.streamable_http_app(), sondern - wie
+bexio-mcp, wo dasselbe Setup nachweislich stabil laeuft - ueber den rohen
+mcp.server.Server + StreamableHTTPSessionManager, von Hand in eine Starlette-App
+verdrahtet. Grund: mit identischem NPM-Reverse-Proxy, identischem json_response=True
+und identischem stateful-Modus blieb der FastMCP-Pfad "Missing session ID (-32600)"
+liefern, waehrend der handverdrahtete SessionManager-Pfad bei bexio zuverlaessig
+funktioniert. FastMCPs eigene interne Verdrahtung von streamable_http_app() ist damit
+als Unterschied ausgeschlossen.
 """
 
+import asyncio
 import base64
+import json
 import os
 from typing import Any
 
 import httpx
-try:
-    from mcp.server.fastmcp import FastMCP  # mcp < 2.0.0
-except ModuleNotFoundError:
-    from mcp.server.mcpserver import MCPServer as FastMCP  # mcp >= 2.0.0 (renamed)
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
 
 ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "")
 ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
-
-# host hier durchreichen, damit die MCP-SDK ihren eingebauten DNS-Rebinding-
-# Schutz nicht faelschlich aktiviert: dieser Schutz greift automatisch, sobald
-# host auf "127.0.0.1"/"localhost"/"::1" steht (SDK-Default), und blockt dann
-# jeden Request mit einem anderen Host-Header (421 "Invalid Host header") -
-# auch wenn der Server ueber MCP_HOST/uvicorn bereits auf 0.0.0.0 bindet und
-# ueber eine oeffentliche Domain per Reverse-Proxy erreichbar ist. Mit
-# MCP_HOST=0.0.0.0 (Cloud-Betrieb) bleibt der Schutz aus - die eigentliche
-# Absicherung uebernimmt ohnehin MCP_AUTH_TOKEN/BearerAuthMiddleware.
-#
-# json_response=True: einfache application/json-Antworten statt SSE-Stream
-# (text/event-stream). Fuer reine Request/Response-Tool-Aufrufe ohne Server-
-# Push ist das ausreichend und robuster gegenueber Reverse-Proxies - eine
-# normale HTTP-Antwort mit Content-Length wird sauber abgeschlossen, waehrend
-# ein SSE-Stream bei ungluecklicher Proxy-Konfiguration (Puffering, offene
-# Verbindung) als Haenger/Timeout beim Client ankommen kann, obwohl der Server
-# die Antwort laengst korrekt verarbeitet hat.
-#
-# stateless_http=False (Standard, spec-konform): ein Versuch mit
-# stateless_http=True lief serverseitig sauber (per Logs bestaetigt), aber der
-# Claude-Connector kam mit den fehlenden Session-IDs nicht zurecht und meldete
-# weiterhin Timeouts, obwohl der Server laengst geantwortet hatte. Mit echten
-# Session-IDs (stateful) UND json_response=True liefen in Tests 5
-# aufeinanderfolgende Reconnect-Zyklen sauber durch.
-mcp = FastMCP(
-    "Zammad",
-    host=os.environ.get("MCP_HOST", "127.0.0.1"),
-    json_response=True,
-)
 
 
 def get_headers() -> dict:
@@ -71,7 +53,6 @@ def api_get(path: str, params: dict = None) -> Any:
     return response.json()
 
 
-@mcp.tool()
 def search_tickets(query: str, limit: int = 20) -> list[dict]:
     """Tickets in Zammad suchen."""
     result = api_get("/tickets/search", params={"query": query, "limit": limit})
@@ -102,7 +83,6 @@ def search_tickets(query: str, limit: int = 20) -> list[dict]:
     ]
 
 
-@mcp.tool()
 def get_ticket(ticket_id: int) -> dict:
     """Ein einzelnes Ticket mit allen Artikeln und Anhängen abrufen."""
     ticket = api_get(f"/tickets/{ticket_id}")
@@ -140,7 +120,6 @@ def get_ticket(ticket_id: int) -> dict:
     }
 
 
-@mcp.tool()
 def list_recent_tickets(limit: int = 25) -> list[dict]:
     """Die neuesten Tickets auflisten."""
     tickets = api_get("/tickets", params={"per_page": limit, "page": 1, "sort_by": "created_at", "order_by": "desc"})
@@ -157,7 +136,6 @@ def list_recent_tickets(limit: int = 25) -> list[dict]:
     return []
 
 
-@mcp.tool()
 def download_attachment(ticket_id: int, article_id: int, attachment_id: int) -> dict:
     """Einen Anhang aus einem Ticket-Artikel herunterladen (base64-kodiert)."""
     if not ZAMMAD_URL:
@@ -172,7 +150,6 @@ def download_attachment(ticket_id: int, article_id: int, attachment_id: int) -> 
     }
 
 
-@mcp.tool()
 def find_invoice_aggregation_tickets(limit: int = 50) -> list[dict]:
     """
     Tickets mit Invoice Aggregation Excel-Anhängen suchen.
@@ -212,20 +189,17 @@ def find_invoice_aggregation_tickets(limit: int = 50) -> list[dict]:
     return found
 
 
-@mcp.tool()
 def list_overviews() -> list[dict]:
     """Alle Ticket-Übersichten (Kategorien) in Zammad auflisten, z.B. Offen, Wartend, etc."""
     overviews = api_get("/ticket_overviews")
     return [{"id": o["id"], "name": o["name"], "link": o.get("link", ""), "count": o.get("count", 0)} for o in overviews]
 
 
-@mcp.tool()
 def get_open_tickets(limit: int = 100) -> list[dict]:
     """Alle offenen Tickets abrufen (state: new oder open)."""
     return _get_tickets_by_states(["new", "open"], limit)
 
 
-@mcp.tool()
 def get_pending_reached_tickets(limit: int = 100) -> list[dict]:
     """Alle 'Warten erreicht' Tickets abrufen — pending reminder Tickets wo die Wartezeit abgelaufen ist."""
     from datetime import datetime, timezone
@@ -281,7 +255,6 @@ def _get_tickets_by_states(state_names: list[str], limit: int) -> list[dict]:
     ]
 
 
-@mcp.tool()
 def create_ticket(
     title: str,
     body: str,
@@ -388,7 +361,6 @@ def create_ticket(
     }
 
 
-@mcp.tool()
 def add_ticket_note(ticket_id: int, body: str) -> dict:
     """
     Interne Notiz zu einem Ticket hinzufügen (nur intern sichtbar, nicht an Kunde).
@@ -406,7 +378,6 @@ def add_ticket_note(ticket_id: int, body: str) -> dict:
     return {"success": True, "article_id": response.json().get("id")}
 
 
-@mcp.tool()
 def update_ticket_state(ticket_id: int, state: str) -> dict:
     """
     Ticket-Status ändern. Mögliche Werte: 'new', 'open', 'closed', 'pending reminder', 'pending close'
@@ -427,7 +398,6 @@ def update_ticket_state(ticket_id: int, state: str) -> dict:
     return {"success": True, "ticket_id": ticket_id, "new_state": state}
 
 
-@mcp.tool()
 def set_ticket_pending(ticket_id: int, pending_date: str, note: str = "") -> dict:
     """
     Ticket auf 'pending reminder' setzen mit Datum (Format: YYYY-MM-DD).
@@ -457,7 +427,6 @@ def set_ticket_pending(ticket_id: int, pending_date: str, note: str = "") -> dic
     return {"success": True, "ticket_id": ticket_id, "pending_until": pending_date}
 
 
-@mcp.tool()
 def merge_ticket(ticket_id: int, master_ticket_number: str) -> dict:
     """
     Zwei Tickets zusammenfuehren (Zammad Merge-Funktion, native Zammad-Funktion,
@@ -486,7 +455,6 @@ def merge_ticket(ticket_id: int, master_ticket_number: str) -> dict:
     }
 
 
-@mcp.tool()
 def delete_ticket_article(article_id: int) -> dict:
     """Einen Ticket-Artikel (z.B. falsche Notiz) löschen."""
     url = f"{ZAMMAD_URL}/api/v1/ticket_articles/{article_id}"
@@ -495,7 +463,6 @@ def delete_ticket_article(article_id: int) -> dict:
     return {"success": True, "deleted_article_id": article_id}
 
 
-@mcp.tool()
 def forward_ticket(
     ticket_id: int,
     article_id: int,
@@ -581,6 +548,175 @@ def forward_ticket(
 
 
 # ---------------------------------------------------------------------------
+# MCP-Server (low-level): Tool-Liste + Dispatch
+# ---------------------------------------------------------------------------
+# Bewusst der rohe mcp.server.Server statt FastMCP - identisch zu bexio-mcp,
+# das mit exakt diesem Unterbau stabil laeuft (siehe Modul-Docstring oben).
+
+server = Server("zammad-connector")
+
+TOOL_FUNCS = {
+    "search_tickets": search_tickets,
+    "get_ticket": get_ticket,
+    "list_recent_tickets": list_recent_tickets,
+    "download_attachment": download_attachment,
+    "find_invoice_aggregation_tickets": find_invoice_aggregation_tickets,
+    "list_overviews": list_overviews,
+    "get_open_tickets": get_open_tickets,
+    "get_pending_reached_tickets": get_pending_reached_tickets,
+    "create_ticket": create_ticket,
+    "add_ticket_note": add_ticket_note,
+    "update_ticket_state": update_ticket_state,
+    "set_ticket_pending": set_ticket_pending,
+    "merge_ticket": merge_ticket,
+    "delete_ticket_article": delete_ticket_article,
+    "forward_ticket": forward_ticket,
+}
+
+
+@server.list_tools()
+async def list_tools():
+    return [
+        Tool(
+            name="search_tickets",
+            description="Tickets in Zammad suchen.",
+            inputSchema={"type": "object", "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            }, "required": ["query"]},
+        ),
+        Tool(
+            name="get_ticket",
+            description="Ein einzelnes Ticket mit allen Artikeln und Anhängen abrufen.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+            }, "required": ["ticket_id"]},
+        ),
+        Tool(
+            name="list_recent_tickets",
+            description="Die neuesten Tickets auflisten.",
+            inputSchema={"type": "object", "properties": {
+                "limit": {"type": "integer", "default": 25},
+            }},
+        ),
+        Tool(
+            name="download_attachment",
+            description="Einen Anhang aus einem Ticket-Artikel herunterladen (base64-kodiert).",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "article_id": {"type": "integer"},
+                "attachment_id": {"type": "integer"},
+            }, "required": ["ticket_id", "article_id", "attachment_id"]},
+        ),
+        Tool(
+            name="find_invoice_aggregation_tickets",
+            description="Tickets mit Invoice Aggregation Excel-Anhängen suchen. Gibt eine Liste sortiert nach Dateiname (= Datum) zurück.",
+            inputSchema={"type": "object", "properties": {
+                "limit": {"type": "integer", "default": 50},
+            }},
+        ),
+        Tool(
+            name="list_overviews",
+            description="Alle Ticket-Übersichten (Kategorien) in Zammad auflisten, z.B. Offen, Wartend, etc.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="get_open_tickets",
+            description="Alle offenen Tickets abrufen (state: new oder open).",
+            inputSchema={"type": "object", "properties": {
+                "limit": {"type": "integer", "default": 100},
+            }},
+        ),
+        Tool(
+            name="get_pending_reached_tickets",
+            description="Alle 'Warten erreicht' Tickets abrufen — pending reminder Tickets wo die Wartezeit abgelaufen ist.",
+            inputSchema={"type": "object", "properties": {
+                "limit": {"type": "integer", "default": 100},
+            }},
+        ),
+        Tool(
+            name="create_ticket",
+            description="Neues Ticket in Zammad erstellen. Pflichtfelder: title, body, customer_email. Optionale Felder: group (leer = erste verfügbare Gruppe), state ('new', 'open', etc.), priority ('1 low', '2 normal', '3 high').",
+            inputSchema={"type": "object", "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "customer_email": {"type": "string"},
+                "group": {"type": "string", "default": ""},
+                "state": {"type": "string", "default": "new"},
+                "priority": {"type": "string", "default": "2 normal"},
+            }, "required": ["title", "body", "customer_email"]},
+        ),
+        Tool(
+            name="add_ticket_note",
+            description="Interne Notiz zu einem Ticket hinzufügen (nur intern sichtbar, nicht an Kunde).",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "body": {"type": "string"},
+            }, "required": ["ticket_id", "body"]},
+        ),
+        Tool(
+            name="update_ticket_state",
+            description="Ticket-Status ändern. Mögliche Werte: 'new', 'open', 'closed', 'pending reminder', 'pending close'",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "state": {"type": "string"},
+            }, "required": ["ticket_id", "state"]},
+        ),
+        Tool(
+            name="set_ticket_pending",
+            description="Ticket auf 'pending reminder' setzen mit Datum (Format: YYYY-MM-DD). Optional: interne Notiz hinterlegen. Beispiel: pending_date='2026-06-21'",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "pending_date": {"type": "string"},
+                "note": {"type": "string", "default": ""},
+            }, "required": ["ticket_id", "pending_date"]},
+        ),
+        Tool(
+            name="merge_ticket",
+            description="Zwei Tickets zusammenfuehren (Zammad Merge-Funktion). Alle Artikel von ticket_id wandern in das Ziel-Ticket (master_ticket_number); das Quellticket wird danach automatisch geschlossen.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer", "description": "Interne Zammad Ticket-ID des Tickets, das gemergt werden soll"},
+                "master_ticket_number": {"type": "string", "description": "Ticket-NUMMER (kundenseitiges 'number'-Feld, NICHT die interne ID!) des Ziel-Tickets"},
+            }, "required": ["ticket_id", "master_ticket_number"]},
+        ),
+        Tool(
+            name="delete_ticket_article",
+            description="Einen Ticket-Artikel (z.B. falsche Notiz) löschen.",
+            inputSchema={"type": "object", "properties": {
+                "article_id": {"type": "integer"},
+            }, "required": ["article_id"]},
+        ),
+        Tool(
+            name="forward_ticket",
+            description="Einen Ticket-Artikel per E-Mail weiterleiten. Erstellt einen neuen Email-Artikel im Ticket mit dem Original als Weiterleitung.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "article_id": {"type": "integer", "description": "ID des weiterzuleitenden Artikels"},
+                "to": {"type": "string", "description": "Empfänger E-Mail-Adresse"},
+                "body": {"type": "string", "default": "", "description": "Optionaler Text vor dem weitergeleiteten Inhalt"},
+                "include_attachments": {"type": "boolean", "default": True},
+                "attachment_filenames": {"type": "array", "items": {"type": "string"}, "description": "Optional: nur Anhänge mit passendem Dateinamen mitschicken"},
+            }, "required": ["ticket_id", "article_id", "to"]},
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    func = TOOL_FUNCS.get(name)
+    if not func:
+        return [TextContent(type="text", text=f"Unbekanntes Tool: {name}")]
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: func(**(arguments or {})))
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=f"Zammad API Fehler {e.response.status_code} @ {e.request.url}: {e.response.text}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Fehler: {str(e)}")]
+
+
+# ---------------------------------------------------------------------------
 # Cloud/HTTP-Betrieb
 # ---------------------------------------------------------------------------
 # MCP_TRANSPORT=http aktiviert den Streamable-HTTP-Modus fuer den Cloud-Einsatz
@@ -589,6 +725,16 @@ def forward_ticket(
 # MCP_AUTH_TOKEN startet der HTTP-Modus NICHT (fail-safe, kein offener Endpoint).
 
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+
+
+class _StreamableHTTPASGIApp:
+    """Minimaler ASGI-Wrapper um den StreamableHTTPSessionManager (wie bexio-mcp)."""
+
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+
+    async def __call__(self, scope, receive, send):
+        await self.session_manager.handle_request(scope, receive, send)
 
 
 class BearerAuthMiddleware:
@@ -615,6 +761,55 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+async def run_http_server():
+    """Streamable-HTTP-Transport für Cloud-/Docker-Betrieb (MCP_TRANSPORT=http),
+    handverdrahtet identisch zu bexio-mcp (siehe Modul-Docstring)."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.middleware.cors import CORSMiddleware
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import TransportSecuritySettings
+    import uvicorn
+
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+
+    # security_settings explizit gesetzt statt der SDK-eigenen Auto-Erkennung
+    # zu ueberlassen - siehe bexio-mcp fuer die ausfuehrliche Begruendung
+    # (DNS-Rebinding-Schutz wuerde sonst jeden Request mit oeffentlichem
+    # Host-Header blocken; die eigentliche Absicherung uebernimmt ohnehin
+    # MCP_AUTH_TOKEN/BearerAuthMiddleware).
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,
+        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    mcp_asgi_app = _StreamableHTTPASGIApp(session_manager)
+
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=mcp_asgi_app)],
+        lifespan=lambda app: session_manager.run(),
+    )
+    secured_app = BearerAuthMiddleware(app, MCP_AUTH_TOKEN)
+    # CORS aussen um die Auth-Middleware: Browser-basierte MCP-Clients (z.B.
+    # Claude.ai) rufen den Endpoint per Cross-Origin-JS-Fetch auf. Ohne CORS-
+    # Header blockt der Browser die Antwort, bevor der Client sie ueberhaupt
+    # sieht. Preflight-OPTIONS-Requests (ohne Authorization-Header) werden von
+    # CORSMiddleware direkt beantwortet, bevor sie die Bearer-Pruefung erreichen.
+    cors_app = CORSMiddleware(
+        secured_app,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id"],
+    )
+
+    config = uvicorn.Config(cors_app, host=host, port=port, log_level="info")
+    srv = uvicorn.Server(config)
+    print(f"Zammad MCP HTTP server running on {host}:{port}", flush=True)
+    await srv.serve()
+
+
 def main():
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 
@@ -624,32 +819,12 @@ def main():
                 "MCP_TRANSPORT=http erfordert MCP_AUTH_TOKEN (statisches Bearer-Token) - "
                 "aus Sicherheitsgruenden kein Start ohne Token."
             )
-        import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
-
-        host = os.environ.get("MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("MCP_PORT", "8000"))
-
-        app = mcp.streamable_http_app()
-        secured_app = BearerAuthMiddleware(app, MCP_AUTH_TOKEN)
-        # CORS aussen um die Auth-Middleware: Browser-basierte MCP-Clients (z.B.
-        # Claude.ai) rufen den Endpoint per Cross-Origin-JS-Fetch auf. Ohne CORS-
-        # Header blockt der Browser die Antwort, bevor der Client sie ueberhaupt
-        # sieht - das sieht dann wie "Server nicht erreichbar" aus, obwohl der
-        # Server laeuft. Preflight-OPTIONS-Requests (ohne Authorization-Header)
-        # werden von CORSMiddleware direkt beantwortet, bevor sie die Bearer-
-        # Pruefung erreichen.
-        cors_app = CORSMiddleware(
-            secured_app,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            expose_headers=["mcp-session-id"],
-        )
-
-        uvicorn.run(cors_app, host=host, port=port, log_level="info")
+        asyncio.run(run_http_server())
     else:
-        mcp.run(transport="stdio")
+        async def _run_stdio():
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(read_stream, write_stream, server.create_initialization_options())
+        asyncio.run(_run_stdio())
 
 
 if __name__ == "__main__":
