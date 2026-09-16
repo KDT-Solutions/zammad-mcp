@@ -43,10 +43,18 @@ ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
 # keine serverseitig initiierten Push-Nachrichten ueber eine lange Sitzung
 # braucht (reine Request/Response-Tool-Aufrufe), behebt der zustandslose Modus
 # das Problem vollstaendig, ohne Funktionalitaet zu verlieren.
+# json_response=True: einfache application/json-Antworten statt SSE-Stream
+# (text/event-stream). Fuer reine Request/Response-Tool-Aufrufe ohne Server-
+# Push ist das ausreichend und robuster gegenueber Reverse-Proxies - eine
+# normale HTTP-Antwort mit Content-Length wird sauber abgeschlossen, waehrend
+# ein SSE-Stream bei ungluecklicher Proxy-Konfiguration (Puffering, offene
+# Verbindung) als Haenger/Timeout beim Client ankommen kann, obwohl der Server
+# die Antwort laengst korrekt verarbeitet hat.
 mcp = FastMCP(
     "Zammad",
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
     stateless_http=True,
+    json_response=True,
 )
 
 
