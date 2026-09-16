@@ -1,7 +1,12 @@
 services:
   zammad-mcp:
-    build: .
-    image: zammad-mcp-cloud:latest
+    # Fertiges Image aus der GitHub Container Registry statt lokalem Build -
+    # das Image wird per GitHub Actions bei jedem Push auf main automatisch
+    # gebaut und veroeffentlicht (.github/workflows/docker-publish.yml).
+    # Dadurch funktioniert "Pull and redeploy" in Portainer zuverlaessig:
+    # Portainer kann Images pullen, aber ein Dockerfile im Repo nicht
+    # zuverlaessig automatisch neu bauen (bekannte Einschraenkung).
+    image: ghcr.io/kdt-solutions/zammad-mcp:latest
     container_name: zammad-mcp-cloud
     restart: unless-stopped
     environment:

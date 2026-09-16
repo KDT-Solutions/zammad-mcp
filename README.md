@@ -48,6 +48,12 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 
 `MCP_HOST`/`MCP_PORT` steuern den Server im Container, `MCP_BIND_ADDR`/`MCP_HOST_PORT` das Port-Mapping nach aussen (docker-compose `ports:`) - getrennt, damit man den Container z.B. nur auf localhost binden und den öffentlichen Zugriff über einen Reverse-Proxy führen kann.
 
+## Image-Build (GitHub Actions → GitHub Container Registry)
+
+Das Docker-Image wird **nicht** lokal aus dem Dockerfile gebaut, sondern bei jedem Push auf `main` automatisch per GitHub Actions gebaut und nach `ghcr.io/<repo>:latest` veröffentlicht (`.github/workflows/docker-publish.yml`). Grund: Portainer kann Images zuverlässig pullen, aber ein Dockerfile im Repo nicht zuverlässig automatisch neu bauen - "Pull and redeploy" funktioniert dadurch immer nur mit einer schon vorhandenen lokalen Kopie, nicht mit einem frischen Build. Mit einem fertigen Image aus einer Registry fällt dieses Problem weg.
+
+**Einmalig nach dem ersten Push:** Das neu erstellte Package ist auf GitHub standardmässig privat, auch wenn das Repo öffentlich ist. Unter `github.com/KDT-Solutions/zammad-mcp` → Reiter **Packages** → `zammad-mcp` → **Package settings** → **Change visibility** → **Public** stellen, sonst kann Portainer das Image nicht ohne Zugangsdaten pullen.
+
 ## Cloud-Betrieb (Docker Compose, manuell)
 
 ```bash
@@ -55,14 +61,14 @@ git clone <repo-url> zammad-mcp
 cd zammad-mcp
 cp .env.example .env
 # .env ausfüllen: ZAMMAD_URL, ZAMMAD_TOKEN, MCP_AUTH_TOKEN (langes zufälliges Token generieren)
-docker compose up -d --build
+docker compose up -d
 ```
 
-Update auf eine neue Version:
+Update auf eine neue Version (holt das neueste, per GitHub Actions gebaute Image):
 
 ```bash
-git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 ## Cloud-Betrieb via Portainer (empfohlen)
@@ -75,7 +81,7 @@ docker compose up -d --build
    - `MCP_AUTH_TOKEN`
    - optional `MCP_BIND_ADDR` / `MCP_HOST_PORT`, falls die Standardwerte nicht passen
 4. **Deploy the stack**
-5. Für ein Update später: im Stack auf **Pull and redeploy** (holt den neuesten Repo-Stand und baut neu)
+5. Für ein Update später: im Stack auf **Pull and redeploy** klicken - das zieht jetzt zuverlässig das aktuelle Image aus der Registry (kein lokaler Build mehr nötig, siehe oben)
 
 Da `docker-compose.yml` alle Werte ausschliesslich über `${VARIABLE}`-Platzhalter referenziert, funktioniert das identisch für lokales `docker compose` (mit `.env`-Datei) und für Portainer (mit den dort hinterlegten Stack-Variablen) - ohne Anpassungen am Repo.
 
