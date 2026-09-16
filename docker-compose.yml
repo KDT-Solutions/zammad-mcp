@@ -1,0 +1,18 @@
+services:
+  zammad-mcp:
+    build: .
+    image: zammad-mcp-cloud:latest
+    container_name: zammad-mcp-cloud
+    restart: unless-stopped
+    environment:
+      - ZAMMAD_URL=${ZAMMAD_URL}
+      - ZAMMAD_TOKEN=${ZAMMAD_TOKEN}
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      - MCP_TRANSPORT=http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+    ports:
+      # Standardmässig nur auf localhost binden - öffentlicher Zugriff läuft
+      # über einen Reverse-Proxy (Plesk/nginx) mit TLS. Bind-Adresse und Port
+      # sind über Env-Variablen überschreibbar (z.B. für Portainer).
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8420}:8000"
