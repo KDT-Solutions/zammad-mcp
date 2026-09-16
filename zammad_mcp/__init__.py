@@ -398,6 +398,18 @@ def update_ticket_state(ticket_id: int, state: str) -> dict:
     return {"success": True, "ticket_id": ticket_id, "new_state": state}
 
 
+def update_ticket_title(ticket_id: int, title: str) -> dict:
+    """
+    Ticket-Titel ändern, z.B. um einen generischen Titel (wie 'Dodolock Kontaktformular')
+    durch einen zum tatsächlichen Inhalt passenden Titel zu ersetzen.
+    """
+    url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
+    response = httpx.put(url, headers=get_headers(), json={"title": title}, timeout=30)
+    response.raise_for_status()
+    updated = response.json()
+    return {"success": True, "ticket_id": ticket_id, "new_title": updated.get("title", title)}
+
+
 def set_ticket_pending(ticket_id: int, pending_date: str, note: str = "") -> dict:
     """
     Ticket auf 'pending reminder' setzen mit Datum (Format: YYYY-MM-DD).
@@ -567,6 +579,7 @@ TOOL_FUNCS = {
     "create_ticket": create_ticket,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
+    "update_ticket_title": update_ticket_title,
     "set_ticket_pending": set_ticket_pending,
     "merge_ticket": merge_ticket,
     "delete_ticket_article": delete_ticket_article,
@@ -661,6 +674,14 @@ async def list_tools():
                 "ticket_id": {"type": "integer"},
                 "state": {"type": "string"},
             }, "required": ["ticket_id", "state"]},
+        ),
+        Tool(
+            name="update_ticket_title",
+            description="Ticket-Titel ändern, z.B. um einen generischen Titel (wie 'Dodolock Kontaktformular') durch einen zum tatsächlichen Inhalt passenden Titel zu ersetzen.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "title": {"type": "string"},
+            }, "required": ["ticket_id", "title"]},
         ),
         Tool(
             name="set_ticket_pending",

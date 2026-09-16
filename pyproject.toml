@@ -1,6 +1,6 @@
 [project]
 name = "zammad-mcp"
-version = "1.16.0"
+version = "1.17.0"
 description = "Zammad MCP Server für Claude (stdio lokal + HTTP/Docker cloud)"
 requires-python = ">=3.11"
 dependencies = [
