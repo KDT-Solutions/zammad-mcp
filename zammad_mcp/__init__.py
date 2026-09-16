@@ -25,7 +25,15 @@ except ModuleNotFoundError:
 ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "")
 ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
 
-mcp = FastMCP("Zammad")
+# host hier durchreichen, damit die MCP-SDK ihren eingebauten DNS-Rebinding-
+# Schutz nicht faelschlich aktiviert: dieser Schutz greift automatisch, sobald
+# host auf "127.0.0.1"/"localhost"/"::1" steht (SDK-Default), und blockt dann
+# jeden Request mit einem anderen Host-Header (421 "Invalid Host header") -
+# auch wenn der Server ueber MCP_HOST/uvicorn bereits auf 0.0.0.0 bindet und
+# ueber eine oeffentliche Domain per Reverse-Proxy erreichbar ist. Mit
+# MCP_HOST=0.0.0.0 (Cloud-Betrieb) bleibt der Schutz aus - die eigentliche
+# Absicherung uebernimmt ohnehin MCP_AUTH_TOKEN/BearerAuthMiddleware.
+mcp = FastMCP("Zammad", host=os.environ.get("MCP_HOST", "127.0.0.1"))
 
 
 def get_headers() -> dict:
