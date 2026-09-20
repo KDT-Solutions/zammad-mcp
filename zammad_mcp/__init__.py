@@ -53,15 +53,61 @@ def api_get(path: str, params: dict = None) -> Any:
     return response.json()
 
 
+_CACHE: dict = {}
+
+
+def _name_map(path: str) -> dict:
+    """Id -> Name (z.B. Gruppen, Prioritaeten), pro Prozess gecacht. Bei Fehler leer (Fallback auf ID)."""
+    if path not in _CACHE:
+        try:
+            _CACHE[path] = {str(x["id"]): x["name"] for x in api_get(path)}
+        except Exception:
+            return {}
+    return _CACHE[path]
+
+
+def _user_label(user_id, assets: dict = None):
+    """'Vorname Nachname <mail>' zu einer User-ID, gecacht. Nutzt vorhandene Search-Assets vor einem API-Call."""
+    if not user_id:
+        return None
+    key = f"user:{user_id}"
+    if key in _CACHE:
+        return _CACHE[key]
+    u = ((assets or {}).get("User") or {}).get(str(user_id))
+    if u is None:
+        try:
+            u = api_get(f"/users/{user_id}")
+        except Exception:
+            return f"User {user_id}"
+    name = " ".join(x for x in (u.get("firstname"), u.get("lastname")) if x).strip()
+    mail = u.get("email") or u.get("login")
+    label = f"{name} <{mail}>" if name and mail else (mail or name or f"User {user_id}")
+    _CACHE[key] = label
+    return label
+
+
+def _ticket_meta(t: dict, assets: dict = None) -> dict:
+    """Gruppe, Prioritaet, Kunde und Owner eines Tickets (Owner-ID 1 = System, wird weggelassen)."""
+    owner_id = t.get("owner_id")
+    return {
+        "group": _name_map("/groups").get(str(t.get("group_id")), t.get("group_id")),
+        "priority": _name_map("/ticket_priorities").get(str(t.get("priority_id")), t.get("priority_id")),
+        "customer": _user_label(t.get("customer_id"), assets),
+        "owner": _user_label(owner_id, assets) if owner_id and owner_id != 1 else None,
+    }
+
+
 def search_tickets(query: str, limit: int = 20) -> list[dict]:
     """Tickets in Zammad suchen."""
     result = api_get("/tickets/search", params={"query": query, "limit": limit})
     # Zammad returns either a list or {assets: {Ticket: {}}, ticket_ids: [...]}
+    all_assets: dict = {}
     if isinstance(result, list):
         tickets = result
     else:
         ticket_ids = result.get("ticket_ids", [])
-        assets = result.get("assets", {}).get("Ticket", {})
+        all_assets = result.get("assets", {}) or {}
+        assets = all_assets.get("Ticket", {})
         tickets = [assets[str(tid)] for tid in ticket_ids if str(tid) in assets]
 
     # Fetch state names if not already available
@@ -78,6 +124,7 @@ def search_tickets(query: str, limit: int = 20) -> list[dict]:
             "state": states.get(str(t.get("state_id")), t.get("state_id")),
             "created_at": t.get("created_at"),
             "updated_at": t.get("updated_at"),
+            **_ticket_meta(t, all_assets),
         }
         for t in tickets
     ]
@@ -85,7 +132,7 @@ def search_tickets(query: str, limit: int = 20) -> list[dict]:
 
 def get_ticket(ticket_id: int) -> dict:
     """Ein einzelnes Ticket mit allen Artikeln und Anhängen abrufen."""
-    ticket = api_get(f"/tickets/{ticket_id}")
+    ticket = api_get(f"/tickets/{ticket_id}", params={"expand": "true"})
     articles = api_get(f"/ticket_articles/by_ticket/{ticket_id}")
     try:
         states = {str(s["id"]): s["name"] for s in api_get("/ticket_states")}
@@ -98,6 +145,9 @@ def get_ticket(ticket_id: int) -> dict:
         "title": ticket.get("title"),
         "state": states.get(str(ticket.get("state_id")), ticket.get("state_id")),
         "created_at": ticket.get("created_at"),
+        "updated_at": ticket.get("updated_at"),
+        "pending_time": ticket.get("pending_time"),
+        **_ticket_meta(ticket),
         "articles": [
             {
                 "id": a["id"],
@@ -130,6 +180,7 @@ def list_recent_tickets(limit: int = 25) -> list[dict]:
                 "number": t.get("number"),
                 "title": t.get("title"),
                 "created_at": t.get("created_at"),
+                **_ticket_meta(t),
             }
             for t in tickets
         ]
@@ -235,11 +286,13 @@ def _get_tickets_by_states(state_names: list[str], limit: int) -> list[dict]:
     query = " OR ".join(f"state_id:{sid}" for sid in target_ids) if target_ids else "*"
     result = api_get("/tickets/search", params={"query": query, "limit": limit, "sort_by": "updated_at", "order_by": "desc"})
 
+    all_assets: dict = {}
     if isinstance(result, list):
         tickets = result
     else:
         ticket_ids = result.get("ticket_ids", [])
-        assets = result.get("assets", {}).get("Ticket", {})
+        all_assets = result.get("assets", {}) or {}
+        assets = all_assets.get("Ticket", {})
         tickets = [assets[str(tid)] for tid in ticket_ids if str(tid) in assets]
 
     return [
@@ -249,6 +302,7 @@ def _get_tickets_by_states(state_names: list[str], limit: int) -> list[dict]:
             "title": t.get("title"),
             "state": state_ids.get(str(t.get("state_id")), str(t.get("state_id"))),
             "updated_at": t.get("updated_at"),
+            **_ticket_meta(t, all_assets),
         }
         for t in tickets
         if not state_names or state_ids.get(str(t.get("state_id"))) in state_names

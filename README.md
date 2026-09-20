@@ -103,10 +103,10 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 
 | Tool | Beschreibung |
 |------|--------------|
-| `search_tickets` | Beliebige Ticket-Suche |
-| `get_ticket` | Ticket mit allen Artikeln und Anhängen abrufen |
-| `list_recent_tickets` | Neueste Tickets auflisten |
-| `get_open_tickets` | Alle offenen Tickets (new/open) |
+| `search_tickets` | Beliebige Ticket-Suche (Ergebnis inkl. Gruppe, Priorität, Kunde, Owner) |
+| `get_ticket` | Ticket mit allen Artikeln und Anhängen abrufen (inkl. Gruppe, Priorität, Kunde, Owner, pending_time) |
+| `list_recent_tickets` | Neueste Tickets auflisten (inkl. Gruppe, Priorität, Kunde, Owner) |
+| `get_open_tickets` | Alle offenen Tickets (new/open), inkl. Gruppe, Priorität, Kunde, Owner |
 | `get_pending_reached_tickets` | Pending-Reminder-Tickets, deren Wartezeit abgelaufen ist |
 | `list_overviews` | Ticket-Übersichten/Kategorien auflisten |
 | `download_attachment` | Anhang herunterladen (als base64) |
