@@ -309,19 +309,46 @@ def _get_tickets_by_states(state_names: list[str], limit: int) -> list[dict]:
     ]
 
 
+def _resolve_group(group: str) -> tuple[int, str]:
+    """Gruppenname -> (id, name). Kein stiller Fallback: unbekannt/leer ist ein Fehler mit Liste der gueltigen Gruppen."""
+    groups = api_get("/groups")
+    valid = ", ".join(sorted(g["name"] for g in groups if g.get("active", True)))
+    if not group or not group.strip():
+        raise ValueError(f"Gruppe fehlt. Gueltige Gruppen: {valid}")
+    match = next((g for g in groups if g["name"].lower() == group.strip().lower()), None)
+    if not match:
+        raise ValueError(f"Gruppe '{group}' nicht gefunden. Gueltige Gruppen: {valid}")
+    return match["id"], match["name"]
+
+
+def list_groups() -> list[dict]:
+    """Alle aktiven Zammad-Gruppen (id, name) auflisten."""
+    return [{"id": g["id"], "name": g["name"]} for g in api_get("/groups") if g.get("active", True)]
+
+
+def set_ticket_group(ticket_id: int, group: str) -> dict:
+    """Ticket in eine andere Gruppe verschieben (exakter Gruppenname, siehe list_groups)."""
+    group_id, group_name = _resolve_group(group)
+    url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
+    response = httpx.put(url, headers=get_headers(), json={"group_id": group_id}, timeout=30)
+    response.raise_for_status()
+    return {"success": True, "ticket_id": ticket_id, "group": group_name}
+
+
 def create_ticket(
     title: str,
     body: str,
     customer_email: str,
-    group: str = "",
+    group: str,
     state: str = "new",
     priority: str = "2 normal",
 ) -> dict:
     """
     Neues Ticket in Zammad erstellen.
-    Pflichtfelder: title, body, customer_email.
-    Optionale Felder: group (leer = erste verfügbare Gruppe), state ('new', 'open', etc.), priority ('1 low', '2 normal', '3 high').
+    Pflichtfelder: title, body, customer_email, group (exakter Gruppenname, siehe list_groups).
+    Optionale Felder: state ('new', 'open', etc.), priority ('1 low', '2 normal', '3 high').
     """
+    group_id, group_name = _resolve_group(group)
     # Resolve state_id
     try:
         states = api_get("/ticket_states")
@@ -339,20 +366,6 @@ def create_ticket(
             priority_id = 2
     except Exception:
         priority_id = 2
-
-    # Resolve group_id
-    try:
-        groups = api_get("/groups")
-        if group:
-            group_id = next((g["id"] for g in groups if g["name"].lower() == group.lower()), None)
-        else:
-            group_id = None
-        if not group_id:
-            group_id = groups[0]["id"] if groups else 1
-        group_name = next((g["name"] for g in groups if g["id"] == group_id), "")
-    except Exception:
-        group_id = 1
-        group_name = ""
 
     # Resolve or create customer by email
     customer_id = None
@@ -640,6 +653,8 @@ TOOL_FUNCS = {
     "get_open_tickets": get_open_tickets,
     "get_pending_reached_tickets": get_pending_reached_tickets,
     "create_ticket": create_ticket,
+    "list_groups": list_groups,
+    "set_ticket_group": set_ticket_group,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
     "update_ticket_title": update_ticket_title,
@@ -713,15 +728,28 @@ async def list_tools():
         ),
         Tool(
             name="create_ticket",
-            description="Neues Ticket in Zammad erstellen. Pflichtfelder: title, body, customer_email. Optionale Felder: group (leer = erste verfügbare Gruppe), state ('new', 'open', etc.), priority ('1 low', '2 normal', '3 high').",
+            description="Neues Ticket in Zammad erstellen. Pflichtfelder: title, body, customer_email, group (exakter Gruppenname, siehe list_groups; unbekannte Gruppen werden abgelehnt). Optionale Felder: state ('new', 'open', etc.), priority ('1 low', '2 normal', '3 high').",
             inputSchema={"type": "object", "properties": {
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "customer_email": {"type": "string"},
-                "group": {"type": "string", "default": ""},
+                "group": {"type": "string", "description": "Exakter Gruppenname, siehe list_groups"},
                 "state": {"type": "string", "default": "new"},
                 "priority": {"type": "string", "default": "2 normal"},
-            }, "required": ["title", "body", "customer_email"]},
+            }, "required": ["title", "body", "customer_email", "group"]},
+        ),
+        Tool(
+            name="list_groups",
+            description="Alle aktiven Zammad-Gruppen (id, name) auflisten.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="set_ticket_group",
+            description="Ticket in eine andere Gruppe verschieben (exakter Gruppenname, siehe list_groups).",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "group": {"type": "string"},
+            }, "required": ["ticket_id", "group"]},
         ),
         Tool(
             name="add_ticket_note",

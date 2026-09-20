@@ -111,7 +111,9 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `list_overviews` | Ticket-Übersichten/Kategorien auflisten |
 | `download_attachment` | Anhang herunterladen (als base64) |
 | `find_invoice_aggregation_tickets` | Tickets mit Invoice-Aggregation-Excel-Anhängen |
-| `create_ticket` | Neues Ticket erstellen |
+| `create_ticket` | Neues Ticket erstellen (Gruppe ist Pflicht, unbekannte Gruppen werden abgelehnt) |
+| `list_groups` | Alle aktiven Gruppen auflisten |
+| `set_ticket_group` | Ticket in eine andere Gruppe verschieben |
 | `add_ticket_note` | Interne Notiz hinzufügen |
 | `update_ticket_state` | Ticket-Status ändern |
 | `set_ticket_pending` | Ticket auf "pending reminder" setzen |
