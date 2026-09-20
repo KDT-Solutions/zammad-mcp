@@ -117,6 +117,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `set_ticket_pending` | Ticket auf "pending reminder" setzen |
 | `merge_ticket` | Zwei Tickets zusammenführen |
 | `delete_ticket_article` | Ticket-Artikel löschen |
+| `set_article_internal` | Bestehenden Ticket-Artikel auf intern (oder öffentlich) stellen |
 | `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten |
 
 ## Typischer Workflow (Invoice Aggregation)

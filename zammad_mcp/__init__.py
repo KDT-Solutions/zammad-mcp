@@ -521,6 +521,15 @@ def merge_ticket(ticket_id: int, master_ticket_number: str) -> dict:
     }
 
 
+def set_article_internal(article_id: int, internal: bool = True) -> dict:
+    """Einen bestehenden Ticket-Artikel auf intern (oder wieder oeffentlich) stellen."""
+    url = f"{ZAMMAD_URL}/api/v1/ticket_articles/{article_id}"
+    response = httpx.put(url, headers=get_headers(), json={"internal": internal}, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    return {"success": True, "article_id": article_id, "internal": data.get("internal")}
+
+
 def delete_ticket_article(article_id: int) -> dict:
     """Einen Ticket-Artikel (z.B. falsche Notiz) löschen."""
     url = f"{ZAMMAD_URL}/api/v1/ticket_articles/{article_id}"
@@ -637,6 +646,7 @@ TOOL_FUNCS = {
     "set_ticket_pending": set_ticket_pending,
     "merge_ticket": merge_ticket,
     "delete_ticket_article": delete_ticket_article,
+    "set_article_internal": set_article_internal,
     "forward_ticket": forward_ticket,
 }
 
@@ -759,6 +769,14 @@ async def list_tools():
             description="Einen Ticket-Artikel (z.B. falsche Notiz) löschen.",
             inputSchema={"type": "object", "properties": {
                 "article_id": {"type": "integer"},
+            }, "required": ["article_id"]},
+        ),
+        Tool(
+            name="set_article_internal",
+            description="Einen bestehenden Ticket-Artikel auf intern stellen (internal=true, Standard) oder wieder oeffentlich (internal=false). Aendert nur das Flag, sendet nichts.",
+            inputSchema={"type": "object", "properties": {
+                "article_id": {"type": "integer"},
+                "internal": {"type": "boolean", "default": True},
             }, "required": ["article_id"]},
         ),
         Tool(
