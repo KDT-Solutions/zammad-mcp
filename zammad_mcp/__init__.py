@@ -33,6 +33,26 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+
+
+def _read_version() -> str:
+    """Version aus pyproject.toml neben dem Paket (Docker/Checkout), sonst aus den installierten Paket-Metadaten."""
+    pyproject = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pyproject.toml")
+    try:
+        import tomllib
+        with open(pyproject, "rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+        return version("zammad-mcp")
+    except Exception:
+        return "unbekannt"
+
+
+__version__ = _read_version()
+
 ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "")
 ZAMMAD_TOKEN = os.environ.get("ZAMMAD_TOKEN", "")
 
@@ -319,6 +339,11 @@ def _resolve_group(group: str) -> tuple[int, str]:
     if not match:
         raise ValueError(f"Gruppe '{group}' nicht gefunden. Gueltige Gruppen: {valid}")
     return match["id"], match["name"]
+
+
+def get_version() -> dict:
+    """Version des laufenden Zammad-MCP-Servers."""
+    return {"name": "zammad-mcp", "version": __version__}
 
 
 def list_groups() -> list[dict]:
@@ -681,9 +706,10 @@ def forward_ticket(
 # Bewusst der rohe mcp.server.Server statt FastMCP - identisch zu bexio-mcp,
 # das mit exakt diesem Unterbau stabil laeuft (siehe Modul-Docstring oben).
 
-server = Server("zammad-connector")
+server = Server("zammad-connector", version=__version__)
 
 TOOL_FUNCS = {
+    "get_version": get_version,
     "search_tickets": search_tickets,
     "get_ticket": get_ticket,
     "list_recent_tickets": list_recent_tickets,
@@ -710,6 +736,11 @@ TOOL_FUNCS = {
 @server.list_tools()
 async def list_tools():
     return [
+        Tool(
+            name="get_version",
+            description="Version des laufenden Zammad-MCP-Servers abfragen.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
         Tool(
             name="search_tickets",
             description="Tickets in Zammad suchen.",

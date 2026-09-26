@@ -103,6 +103,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 
 | Tool | Beschreibung |
 |------|--------------|
+| `get_version` | Version des laufenden MCP-Servers abfragen |
 | `search_tickets` | Beliebige Ticket-Suche (Ergebnis inkl. Gruppe, Priorität, Kunde, Owner) |
 | `get_ticket` | Ticket mit allen Artikeln und Anhängen abrufen (inkl. Gruppe, Priorität, Kunde, Owner, pending_time) |
 | `list_recent_tickets` | Neueste Tickets auflisten (inkl. Gruppe, Priorität, Kunde, Owner) |
