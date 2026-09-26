@@ -335,6 +335,46 @@ def set_ticket_group(ticket_id: int, group: str) -> dict:
     return {"success": True, "ticket_id": ticket_id, "group": group_name}
 
 
+def _resolve_agent(owner: str) -> tuple[int, str]:
+    """E-Mail, Login oder 'Vorname Nachname' -> (id, label). Nur aktive Agents/Admins, exakter Treffer,
+    kein stiller Fallback: nicht gefunden oder mehrdeutig ist ein Fehler mit Liste der gefundenen Agents."""
+    query = (owner or "").strip()
+    if not query:
+        raise ValueError("Owner fehlt. Erwartet: E-Mail, Login oder 'Vorname Nachname' eines aktiven Agents")
+    users = api_get("/users/search", params={"query": query, "limit": 20, "expand": "true"})
+    agents = [
+        u for u in users
+        if u.get("active") and {"Agent", "Admin"} & set(u.get("roles") or [])
+    ]
+    q = query.lower()
+    matches = []
+    for u in agents:
+        full_name = " ".join(x for x in (u.get("firstname"), u.get("lastname")) if x).strip()
+        candidates = {(u.get("email") or "").lower(), (u.get("login") or "").lower(), full_name.lower()}
+        if q in candidates:
+            matches.append(u)
+    found = ", ".join(_user_label(u["id"], {"User": {str(u["id"]): u}}) for u in agents) or "keine"
+    if not matches:
+        raise ValueError(f"Agent '{owner}' nicht gefunden. Gefundene Agents: {found}")
+    if len(matches) > 1:
+        raise ValueError(f"Agent '{owner}' mehrdeutig. Gefundene Agents: {found}")
+    u = matches[0]
+    return u["id"], _user_label(u["id"], {"User": {str(u["id"]): u}})
+
+
+def set_ticket_owner(ticket_id: int, owner: str) -> dict:
+    """Ticket einem Agent zuweisen. owner = E-Mail, Login oder 'Vorname Nachname'; 'none' entfernt die Zuweisung."""
+    if (owner or "").strip().lower() in ("none", "niemand", "-"):
+        owner_id, label = 1, None
+    else:
+        owner_id, label = _resolve_agent(owner)
+    url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
+    response = httpx.put(url, headers=get_headers(), json={"owner_id": owner_id}, timeout=30)
+    if not response.is_success:
+        return {"success": False, "status_code": response.status_code, "error": response.text}
+    return {"success": True, "ticket_id": ticket_id, "owner": label}
+
+
 def create_ticket(
     title: str,
     body: str,
@@ -655,6 +695,7 @@ TOOL_FUNCS = {
     "create_ticket": create_ticket,
     "list_groups": list_groups,
     "set_ticket_group": set_ticket_group,
+    "set_ticket_owner": set_ticket_owner,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
     "update_ticket_title": update_ticket_title,
@@ -750,6 +791,14 @@ async def list_tools():
                 "ticket_id": {"type": "integer"},
                 "group": {"type": "string"},
             }, "required": ["ticket_id", "group"]},
+        ),
+        Tool(
+            name="set_ticket_owner",
+            description="Ticket einem Agent zuweisen (Owner setzen). owner = E-Mail, Login oder 'Vorname Nachname' eines aktiven Agents; unbekannte oder mehrdeutige Angaben werden abgelehnt. owner='none' entfernt die Zuweisung. Der Agent braucht Zugriff auf die Gruppe des Tickets.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "owner": {"type": "string"},
+            }, "required": ["ticket_id", "owner"]},
         ),
         Tool(
             name="add_ticket_note",
