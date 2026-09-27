@@ -400,6 +400,40 @@ def set_ticket_owner(ticket_id: int, owner: str) -> dict:
     return {"success": True, "ticket_id": ticket_id, "owner": label}
 
 
+def update_customer_name(firstname: str = None, lastname: str = None, email: str = "", ticket_id: int = None) -> dict:
+    """Vor- und/oder Nachname eines Kunden korrigieren. Kunde wird ueber exakte E-Mail oder ueber ticket_id
+    (Kunde des Tickets) bestimmt, genau eines von beiden. Nicht uebergebene Namensfelder bleiben unveraendert."""
+    if bool((email or "").strip()) == bool(ticket_id):
+        raise ValueError("Genau eines von 'email' oder 'ticket_id' angeben")
+    if firstname is None and lastname is None:
+        raise ValueError("Mindestens 'firstname' oder 'lastname' angeben")
+    if ticket_id:
+        customer_id = api_get(f"/tickets/{ticket_id}").get("customer_id")
+        if not customer_id or customer_id == 1:
+            raise ValueError(f"Ticket {ticket_id} hat keinen Kunden")
+    else:
+        q = email.strip().lower()
+        users = api_get("/users/search", params={"query": q, "limit": 20})
+        matches = [u for u in users if (u.get("email") or "").lower() == q]
+        if not matches:
+            raise ValueError(f"Kunde mit E-Mail '{email}' nicht gefunden")
+        if len(matches) > 1:
+            raise ValueError(f"E-Mail '{email}' mehrdeutig ({len(matches)} User gefunden)")
+        customer_id = matches[0]["id"]
+    old = _user_label(customer_id)
+    data = {}
+    if firstname is not None:
+        data["firstname"] = firstname.strip()
+    if lastname is not None:
+        data["lastname"] = lastname.strip()
+    url = f"{ZAMMAD_URL}/api/v1/users/{customer_id}"
+    response = httpx.put(url, headers=get_headers(), json=data, timeout=30)
+    if not response.is_success:
+        return {"success": False, "status_code": response.status_code, "error": response.text}
+    _CACHE.pop(f"user:{customer_id}", None)
+    return {"success": True, "customer_id": customer_id, "old": old, "new": _user_label(customer_id, {"User": {str(customer_id): response.json()}})}
+
+
 def create_ticket(
     title: str,
     body: str,
@@ -722,6 +756,7 @@ TOOL_FUNCS = {
     "list_groups": list_groups,
     "set_ticket_group": set_ticket_group,
     "set_ticket_owner": set_ticket_owner,
+    "update_customer_name": update_customer_name,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
     "update_ticket_title": update_ticket_title,
@@ -830,6 +865,16 @@ async def list_tools():
                 "ticket_id": {"type": "integer"},
                 "owner": {"type": "string"},
             }, "required": ["ticket_id", "owner"]},
+        ),
+        Tool(
+            name="update_customer_name",
+            description="Vor- und/oder Nachname eines Kunden korrigieren. Kunde ueber exakte 'email' ODER ueber 'ticket_id' (Kunde des Tickets) bestimmen, genau eines von beiden. Nur uebergebene Namensfelder werden geaendert.",
+            inputSchema={"type": "object", "properties": {
+                "firstname": {"type": "string"},
+                "lastname": {"type": "string"},
+                "email": {"type": "string"},
+                "ticket_id": {"type": "integer"},
+            }},
         ),
         Tool(
             name="add_ticket_note",

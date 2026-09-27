@@ -116,6 +116,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `list_groups` | Alle aktiven Gruppen auflisten |
 | `set_ticket_group` | Ticket in eine andere Gruppe verschieben |
 | `set_ticket_owner` | Ticket einem Agent zuweisen (E-Mail, Login oder Name; `none` entfernt die Zuweisung) |
+| `update_customer_name` | Vor- und/oder Nachname eines Kunden korrigieren (per E-Mail oder Ticket) |
 | `add_ticket_note` | Interne Notiz hinzufügen |
 | `update_ticket_state` | Ticket-Status ändern |
 | `set_ticket_pending` | Ticket auf "pending reminder" setzen |
