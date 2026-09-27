@@ -343,7 +343,7 @@ def _resolve_group(group: str) -> tuple[int, str]:
 
 def get_version() -> dict:
     """Version des laufenden Zammad-MCP-Servers."""
-    return {"name": "zammad-mcp", "version": __version__}
+    return {"name": "zammad-mcp", "version": __version__, "commit": os.environ.get("GIT_SHA", "unbekannt")}
 
 
 def list_groups() -> list[dict]:
