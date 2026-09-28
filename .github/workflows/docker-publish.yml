@@ -31,6 +31,18 @@ jobs:
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
+        with:
+          # Volle Historie, damit die Patch-Version (Anzahl Commits) stimmt
+          fetch-depth: 0
+
+      - name: Version ermitteln
+        id: version
+        run: |
+          base=$(sed -n 's/^version = "\([0-9]*\.[0-9]*\)\..*"$/\1/p' pyproject.toml)
+          count=$(git rev-list --count HEAD -- Dockerfile requirements.txt pyproject.toml zammad_mcp/ .github/workflows/docker-publish.yml)
+          test -n "$base" && test -n "$count"
+          echo "version=${base}.${count}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${base}.${count}"
 
       - name: Image-Namen in Kleinbuchstaben ermitteln
         id: image
@@ -56,7 +68,9 @@ jobs:
           tags: |
             ${{ steps.image.outputs.name }}:latest
             ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}
           build-args: |
             GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

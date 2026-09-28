@@ -35,20 +35,47 @@ from mcp.types import Tool, TextContent
 
 
 
-def _read_version() -> str:
-    """Version aus pyproject.toml neben dem Paket (Docker/Checkout), sonst aus den installierten Paket-Metadaten."""
-    pyproject = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pyproject.toml")
+# Version = <Major.Minor>.<Patch>. Major.Minor kommt aus pyproject.toml (von Hand
+# gepflegt), der Patch-Teil zaehlt automatisch: Anzahl Commits, die eine der
+# build-relevanten Dateien (Paket, pyproject.toml, Dockerfile, requirements.txt,
+# Workflow) geaendert haben. Im Docker-Image setzt GitHub Actions die fertige
+# Version als APP_VERSION, lokal (Git-Checkout) wird sie aus der Git-Historie berechnet.
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VERSION_PATHS = ['Dockerfile', 'requirements.txt', 'pyproject.toml', 'zammad_mcp/', '.github/workflows/docker-publish.yml']
+
+
+def _version_base() -> str:
+    """Major.Minor aus pyproject.toml (Checkout/Docker), sonst aus den installierten Paket-Metadaten."""
+    raw = ""
     try:
         import tomllib
-        with open(pyproject, "rb") as f:
-            return tomllib.load(f)["project"]["version"]
+        with open(os.path.join(_REPO_DIR, "pyproject.toml"), "rb") as f:
+            raw = tomllib.load(f)["project"]["version"]
+    except Exception:
+        try:
+            from importlib.metadata import version
+            raw = version("zammad-mcp")
+        except Exception:
+            pass
+    return ".".join(raw.split(".")[:2]) if raw else "0.0"
+
+
+def _read_version() -> str:
+    env_version = os.environ.get("APP_VERSION", "").strip()
+    if env_version:
+        return env_version
+    base = _version_base()
+    try:
+        import subprocess
+        count = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD", "--", *_VERSION_PATHS],
+            cwd=_REPO_DIR, capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        if count.isdigit():
+            return f"{base}.{count}"
     except Exception:
         pass
-    try:
-        from importlib.metadata import version
-        return version("zammad-mcp")
-    except Exception:
-        return "unbekannt"
+    return f"{base}.0-dev"
 
 
 __version__ = _read_version()

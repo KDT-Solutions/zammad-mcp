@@ -1,5 +1,7 @@
 [project]
 name = "zammad-mcp"
+# Nur Major.Minor wird von Hand gepflegt, der Patch-Teil wird automatisch
+# aus der Git-Historie gezaehlt (siehe _read_version im Paket).
 version = "1.23.0"
 description = "Zammad MCP Server für Claude (stdio lokal + HTTP/Docker cloud)"
 requires-python = ">=3.11"
