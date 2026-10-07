@@ -24,8 +24,12 @@ als Unterschied ausgeschlossen.
 
 import asyncio
 import base64
+import ipaddress
 import json
 import os
+import re
+import socket
+from urllib.parse import unquote, urlparse
 from typing import Any
 
 import httpx
@@ -677,6 +681,86 @@ def delete_ticket_article(article_id: int) -> dict:
     return {"success": True, "deleted_article_id": article_id}
 
 
+# ---------------------------------------------------------------------------
+# Dateien von externen URLs laden (z.B. Rechnungs-PDF hinter einem Link in der Mail)
+# ---------------------------------------------------------------------------
+# Der Server laedt die Datei selbst herunter, damit der Inhalt nie durch das
+# Sprachmodell muss (kein Base64-Abtippen, Original-PDF bleibt unveraendert).
+# Schutz gegen SSRF: nur http/https, keine privaten/internen Zieladressen
+# (auch nicht nach Redirects), Groessenlimit.
+
+URL_ATTACHMENT_MAX_BYTES = int(os.environ.get("URL_ATTACHMENT_MAX_BYTES", str(20 * 1024 * 1024)))
+URL_ATTACHMENT_MAX_REDIRECTS = 10
+
+
+def _assert_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"Nur http/https-URLs erlaubt: {url}")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as e:
+        raise ValueError(f"Host nicht aufloesbar: {parsed.hostname} ({e})")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError(f"Interne/private Zieladresse nicht erlaubt: {parsed.hostname} -> {ip}")
+
+
+def _filename_from_response(resp: httpx.Response, fallback: str) -> str:
+    cd = resp.headers.get("content-disposition", "")
+    m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", cd, re.I)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
+    if m:
+        return m.group(1).strip()
+    name = os.path.basename(urlparse(str(resp.url)).path)
+    return name or fallback
+
+
+def fetch_url_attachment(url: str, filename: str | None = None, require_pdf: bool = True) -> dict:
+    """
+    Datei von einer oeffentlichen URL laden (Redirects werden einzeln geprueft).
+    Gibt ein Zammad-Attachment-Dict zurueck: filename, data (base64), mime-type.
+    """
+    current = url
+    with httpx.Client(timeout=60, follow_redirects=False) as client:
+        for _ in range(URL_ATTACHMENT_MAX_REDIRECTS + 1):
+            _assert_public_url(current)
+            with client.stream("GET", current, headers={"User-Agent": "Mozilla/5.0 (zammad-mcp)"}) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError(f"Redirect ohne Location: {current}")
+                    current = str(resp.url.join(location))
+                    continue
+                resp.raise_for_status()
+                chunks, size = [], 0
+                for chunk in resp.iter_bytes():
+                    size += len(chunk)
+                    if size > URL_ATTACHMENT_MAX_BYTES:
+                        raise ValueError(f"Datei zu gross (> {URL_ATTACHMENT_MAX_BYTES} Bytes): {url}")
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+                is_pdf = content.startswith(b"%PDF")
+                if require_pdf and not is_pdf:
+                    raise ValueError(f"Keine PDF unter {url} (Content-Type: {mime}, {size} Bytes)")
+                if is_pdf:
+                    mime = "application/pdf"
+                name = filename or _filename_from_response(resp, "dokument.pdf" if is_pdf else "dokument")
+                if is_pdf and not name.lower().endswith(".pdf"):
+                    name += ".pdf"
+                return {
+                    "filename": name,
+                    "data": base64.b64encode(content).decode("utf-8"),
+                    "mime-type": mime,
+                    "_size": size,
+                }
+    raise ValueError(f"Zu viele Redirects: {url}")
+
+
 def forward_ticket(
     ticket_id: int,
     article_id: int,
@@ -684,6 +768,8 @@ def forward_ticket(
     body: str = "",
     include_attachments: bool = True,
     attachment_filenames: list[str] | None = None,
+    attachment_urls: list[str] | None = None,
+    attachment_url_filenames: list[str] | None = None,
 ) -> dict:
     """
     Einen Ticket-Artikel per E-Mail weiterleiten.
@@ -699,6 +785,12 @@ def forward_ticket(
             Anhänge mit passendem Dateinamen mitgeschickt (z.B. nur eine bestimmte PDF,
             ohne weitere Anhänge). Wenn None, gilt include_attachments wie bisher
             (alle oder keine Anhänge).
+        attachment_urls: Optionale Liste von URLs (z.B. Rechnungs-Link aus der Mail).
+            Der Server laedt jede Datei selbst herunter (Redirects/Tracking-Links werden
+            verfolgt) und haengt sie im Original an. Nur PDFs, nur oeffentliche Adressen.
+            Schlaegt ein Download fehl, wird NICHT gesendet.
+        attachment_url_filenames: Optionale Dateinamen zu attachment_urls (gleiche
+            Reihenfolge); sonst Name aus Content-Disposition bzw. URL.
     """
     # Original-Artikel laden
     articles = api_get(f"/ticket_articles/by_ticket/{ticket_id}")
@@ -740,6 +832,19 @@ def forward_ticket(
             except Exception:
                 continue
 
+    # Anhänge von URLs laden (Fehler -> nicht senden, damit nichts ohne Beleg rausgeht)
+    url_files = []
+    for i, att_url in enumerate(attachment_urls or []):
+        name = None
+        if attachment_url_filenames and i < len(attachment_url_filenames):
+            name = attachment_url_filenames[i] or None
+        try:
+            fetched = fetch_url_attachment(att_url, filename=name)
+        except Exception as e:
+            return {"success": False, "error": f"Download fehlgeschlagen, nichts gesendet: {e}"}
+        url_files.append({"filename": fetched["filename"], "size": fetched.pop("_size")})
+        attachments.append(fetched)
+
     payload = {
         "ticket_id": ticket_id,
         "to": to,
@@ -758,7 +863,10 @@ def forward_ticket(
     if not response.is_success:
         return {"success": False, "status_code": response.status_code, "error": response.text}
 
-    return {"success": True, "article_id": response.json().get("id"), "forwarded_to": to}
+    result = {"success": True, "article_id": response.json().get("id"), "forwarded_to": to}
+    if url_files:
+        result["url_attachments"] = url_files
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1069,7 @@ async def list_tools():
         ),
         Tool(
             name="forward_ticket",
-            description="Einen Ticket-Artikel per E-Mail weiterleiten. Erstellt einen neuen Email-Artikel im Ticket mit dem Original als Weiterleitung.",
+            description="Einen Ticket-Artikel per E-Mail weiterleiten. Erstellt einen neuen Email-Artikel im Ticket mit dem Original als Weiterleitung. Mit attachment_urls koennen PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt werden.",
             inputSchema={"type": "object", "properties": {
                 "ticket_id": {"type": "integer"},
                 "article_id": {"type": "integer", "description": "ID des weiterzuleitenden Artikels"},
@@ -969,6 +1077,8 @@ async def list_tools():
                 "body": {"type": "string", "default": "", "description": "Optionaler Text vor dem weitergeleiteten Inhalt"},
                 "include_attachments": {"type": "boolean", "default": True},
                 "attachment_filenames": {"type": "array", "items": {"type": "string"}, "description": "Optional: nur Anhänge mit passendem Dateinamen mitschicken"},
+                "attachment_urls": {"type": "array", "items": {"type": "string"}, "description": "Optional: PDFs von diesen URLs (z.B. Rechnungs-Link in der Mail) serverseitig herunterladen und im Original anhaengen. Redirects werden verfolgt; nur oeffentliche http/https-Adressen. Bei Download-Fehler wird nichts gesendet."},
+                "attachment_url_filenames": {"type": "array", "items": {"type": "string"}, "description": "Optional: Dateinamen zu attachment_urls (gleiche Reihenfolge)"},
             }, "required": ["ticket_id", "article_id", "to"]},
         ),
     ]

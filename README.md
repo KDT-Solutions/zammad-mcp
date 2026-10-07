@@ -123,7 +123,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `merge_ticket` | Zwei Tickets zusammenführen |
 | `delete_ticket_article` | Ticket-Artikel löschen |
 | `set_article_internal` | Bestehenden Ticket-Artikel auf intern (oder öffentlich) stellen |
-| `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten |
+| `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten; mit `attachment_urls` werden PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt (nur oeffentliche http/https-Adressen, max. 20 MB, via `URL_ATTACHMENT_MAX_BYTES` anpassbar) |
 
 ## Typischer Workflow (Invoice Aggregation)
 
