@@ -24,11 +24,18 @@ als Unterschied ausgeschlossen.
 
 import asyncio
 import base64
+import bisect
 import ipaddress
 import json
 import os
 import re
 import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.parse import unquote, urlparse
 from typing import Any
 
@@ -36,6 +43,8 @@ import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+
+from . import attachment_text as _attachment_text
 
 
 
@@ -870,6 +879,321 @@ def forward_ticket(
 
 
 # ---------------------------------------------------------------------------
+# Textextraktion aus Anhaengen (get_attachment_text, find_in_attachments)
+# ---------------------------------------------------------------------------
+# download_attachment liefert Base64, das bei groesseren PDFs im Client abgeschnitten
+# wird. Diese Tools extrahieren den Text serverseitig und geben nur Klartext zurueck.
+# Strikt read-only: es werden ausschliesslich GET-Requests an Zammad geschickt.
+# Die eigentliche Extraktion laeuft in einem eigenen Prozess (attachment_text.py) mit
+# Timeout und Speicherlimit, damit kaputte oder boesartige Dateien den Server nicht
+# blockieren koennen.
+
+ATTACHMENT_TEXT_MAX_BYTES = int(os.environ.get("ATTACHMENT_TEXT_MAX_BYTES", str(25 * 1024 * 1024)))
+ATTACHMENT_TEXT_MAX_PDF_PAGES = int(os.environ.get("ATTACHMENT_TEXT_MAX_PDF_PAGES", "200"))
+ATTACHMENT_TEXT_TIMEOUT = float(os.environ.get("ATTACHMENT_TEXT_TIMEOUT", "30"))
+ATTACHMENT_TEXT_MAX_MEMORY_MB = int(os.environ.get("ATTACHMENT_TEXT_MAX_MEMORY_MB", "1024"))
+ATTACHMENT_TEXT_MAX_CHARS = 50000
+FIND_MAX_TICKETS = 200
+FIND_TOTAL_TIMEOUT = float(os.environ.get("FIND_IN_ATTACHMENTS_TIMEOUT", "240"))
+FIND_WORKERS = 4
+FIND_MAX_MATCHES_PER_ATTACHMENT = 50
+FIND_MAX_MATCHES_TOTAL = 500
+FIND_MAX_LISTED_SKIPPED = 100
+REGEX_MAX_LEN = 200
+REGEX_TIMEOUT = 2.0
+
+_EXTRACT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachment_text.py")
+_TEXT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_TEXT_CACHE_MAX = 16
+_TEXT_CACHE_LOCK = threading.Lock()
+
+
+def _attachment_meta(ticket_id: int, article_id: int, attachment_id: int) -> dict:
+    """Dateiname, Groesse und Content-Type eines Anhangs aus dem Artikel lesen."""
+    article = api_get(f"/ticket_articles/{article_id}")
+    if article.get("ticket_id") is not None and int(article["ticket_id"]) != int(ticket_id):
+        raise ValueError(f"Artikel {article_id} gehoert nicht zu Ticket {ticket_id}")
+    att = next((a for a in article.get("attachments", []) if int(a.get("id", 0)) == int(attachment_id)), None)
+    if att is None:
+        raise ValueError(f"Anhang {attachment_id} nicht in Artikel {article_id} gefunden")
+    return att
+
+
+def _download_attachment_limited(ticket_id: int, article_id: int, attachment_id: int) -> tuple[bytes, str]:
+    """Anhang per GET laden, Abbruch sobald ATTACHMENT_TEXT_MAX_BYTES ueberschritten wird."""
+    if not ZAMMAD_URL:
+        raise RuntimeError("ZAMMAD_URL ist nicht gesetzt (Umgebungsvariable fehlt)")
+    url = f"{ZAMMAD_URL}/api/v1/ticket_attachment/{ticket_id}/{article_id}/{attachment_id}"
+    with httpx.stream("GET", url, headers=get_headers(), timeout=60) as resp:
+        resp.raise_for_status()
+        declared = resp.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > ATTACHMENT_TEXT_MAX_BYTES:
+            raise _AttachmentLimit("size", f"Anhang ist {int(declared)} Bytes gross, erlaubt sind maximal {ATTACHMENT_TEXT_MAX_BYTES}")
+        chunks, size = [], 0
+        for chunk in resp.iter_bytes():
+            size += len(chunk)
+            if size > ATTACHMENT_TEXT_MAX_BYTES:
+                raise _AttachmentLimit("size", f"Anhang ist groesser als {ATTACHMENT_TEXT_MAX_BYTES} Bytes")
+            chunks.append(chunk)
+        return b"".join(chunks), resp.headers.get("content-type", "")
+
+
+class _AttachmentLimit(Exception):
+    def __init__(self, limit: str, message: str):
+        super().__init__(message)
+        self.limit = limit
+
+
+def _run_extraction(data: bytes, kind: str) -> dict:
+    """Extraktion im eigenen Prozess mit hartem Timeout (Prozess wird dann beendet)."""
+    cmd = [sys.executable, "-I", _EXTRACT_WORKER, kind, str(ATTACHMENT_TEXT_MAX_PDF_PAGES), str(ATTACHMENT_TEXT_MAX_MEMORY_MB)]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=ATTACHMENT_TEXT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"Extraktion nach {ATTACHMENT_TEXT_TIMEOUT:g} s abgebrochen (Timeout)", "limit_exceeded": "timeout"}
+    try:
+        return json.loads(proc.stdout.decode("utf-8"))
+    except Exception:
+        stderr = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        return {"ok": False, "error": f"Extraktion fehlgeschlagen (Exit-Code {proc.returncode}): {stderr[-1] if stderr else 'keine Ausgabe'}"}
+
+
+def _extract_attachment(ticket_id: int, article_id: int, attachment_id: int, meta: dict | None = None) -> dict:
+    """Anhang laden und Text extrahieren. Ergebnis immer als Dict mit ok/error, nie Exception
+    wegen der Datei selbst (Zammad-/Netzwerkfehler werden ebenfalls als error gemeldet)."""
+    key = (int(ticket_id), int(article_id), int(attachment_id))
+    with _TEXT_CACHE_LOCK:
+        if key in _TEXT_CACHE:
+            _TEXT_CACHE.move_to_end(key)
+            return _TEXT_CACHE[key]
+
+    info: dict = {"filename": None, "content_type": None}
+    try:
+        if meta is None:
+            meta = _attachment_meta(ticket_id, article_id, attachment_id)
+        info["filename"] = meta.get("filename")
+        info["content_type"] = (meta.get("preferences") or {}).get("Content-Type") or (meta.get("preferences") or {}).get("Mime-Type")
+        size = int(meta.get("size") or 0)
+        if size > ATTACHMENT_TEXT_MAX_BYTES:
+            return {**info, "ok": False, "size_bytes": size, "limit_exceeded": "size",
+                    "error": f"Anhang ist {size} Bytes gross, erlaubt sind maximal {ATTACHMENT_TEXT_MAX_BYTES}"}
+        if _attachment_text.detect_kind(info["filename"], info["content_type"]) is None:
+            return {**info, "ok": False, "error": _unsupported_msg(info)}
+        data, resp_type = _download_attachment_limited(ticket_id, article_id, attachment_id)
+        info["content_type"] = info["content_type"] or resp_type.split(";")[0].strip()
+        kind = _attachment_text.detect_kind(info["filename"], info["content_type"], data)
+        if kind is None:
+            return {**info, "ok": False, "size_bytes": len(data), "error": _unsupported_msg(info)}
+    except _AttachmentLimit as e:
+        return {**info, "ok": False, "limit_exceeded": e.limit, "error": str(e)}
+    except httpx.HTTPStatusError as e:
+        return {**info, "ok": False, "error": f"Zammad API Fehler {e.response.status_code} @ {e.request.url}"}
+    except Exception as e:
+        return {**info, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    result = {**info, "size_bytes": len(data), "kind": kind, **_run_extraction(data, kind)}
+    if result.get("ok"):
+        with _TEXT_CACHE_LOCK:
+            _TEXT_CACHE[key] = result
+            while len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+                _TEXT_CACHE.popitem(last=False)
+    return result
+
+
+def _unsupported_msg(info: dict) -> str:
+    return (
+        f"Dateityp nicht unterstuetzt: {info.get('filename')} ({info.get('content_type') or 'unbekannt'}). "
+        f"Unterstuetzt: PDF, XLSX, DOCX, CSV, TXT"
+    )
+
+
+def get_attachment_text(ticket_id: int, article_id: int, attachment_id: int, offset: int = 0, max_chars: int = 20000) -> dict:
+    """Text eines Anhangs serverseitig extrahieren und seitenweise (offset/max_chars) zurueckgeben."""
+    res = _extract_attachment(ticket_id, article_id, attachment_id)
+    if not res.get("ok"):
+        out = {k: res.get(k) for k in ("filename", "content_type", "size_bytes", "pages") if res.get(k) is not None}
+        out["error"] = res.get("error")
+        if res.get("limit_exceeded"):
+            out["limit_exceeded"] = res["limit_exceeded"]
+        return out
+    text = res["text"]
+    offset = max(0, int(offset or 0))
+    max_chars = min(max(1, int(max_chars or 20000)), ATTACHMENT_TEXT_MAX_CHARS)
+    part = text[offset:offset + max_chars]
+    truncated = offset + len(part) < len(text)
+    out = {
+        "filename": res.get("filename"),
+        "content_type": res.get("content_type"),
+        "extraction_method": res.get("extraction_method"),
+    }
+    if res.get("kind") == "pdf":
+        out["pages"] = res.get("pages")
+        if len(res.get("pages_by_method") or {}) > 1:
+            out["pages_by_method"] = res["pages_by_method"]
+    out.update({
+        "total_chars": len(text),
+        "offset": offset,
+        "returned_chars": len(part),
+        "truncated": truncated,
+    })
+    if truncated:
+        out["next_offset"] = offset + len(part)
+    if res.get("text_limit_reached"):
+        out["text_limit_reached"] = True
+    out["text"] = part
+    return out
+
+
+def _compile_pattern(pattern: str, use_regex: bool):
+    if not pattern:
+        raise ValueError("pattern darf nicht leer sein")
+    if not use_regex:
+        if len(pattern) > 1000:
+            raise ValueError("pattern zu lang (max. 1000 Zeichen)")
+        return re.compile(re.escape(pattern), re.IGNORECASE), False
+    if len(pattern) > REGEX_MAX_LEN:
+        raise ValueError(f"Regex zu lang (max. {REGEX_MAX_LEN} Zeichen)")
+    try:
+        import regex as regex_mod
+    except ImportError:
+        raise ValueError("Regex-Suche nicht verfuegbar (Paket 'regex' fehlt), bitte regex=false verwenden")
+    try:
+        return regex_mod.compile(pattern, regex_mod.IGNORECASE | regex_mod.VERSION0), True
+    except regex_mod.error as e:
+        raise ValueError(f"Ungueltige Regex: {e}")
+
+
+def _section_at(sections: list[dict], pos: int) -> dict | None:
+    if not sections:
+        return None
+    idx = bisect.bisect_right([s["offset"] for s in sections], pos) - 1
+    return sections[idx] if idx >= 0 else None
+
+
+def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, limit_tickets: int = 50, context_chars: int = 150) -> dict:
+    """Tickets per Ticketsuche finden und alle unterstuetzten Anhaenge nach pattern durchsuchen."""
+    compiled, is_regex = _compile_pattern(pattern, bool(regex))
+    limit_tickets = min(max(1, int(limit_tickets or 50)), FIND_MAX_TICKETS)
+    context_chars = min(max(0, int(context_chars if context_chars is not None else 150)), 1000)
+    deadline = time.monotonic() + FIND_TOTAL_TIMEOUT
+
+    result = api_get("/tickets/search", params={"query": ticket_query, "limit": limit_tickets})
+    if isinstance(result, list):
+        tickets = result
+    else:
+        assets = (result.get("assets") or {}).get("Ticket", {})
+        tickets = [assets[str(tid)] for tid in result.get("ticket_ids", []) if str(tid) in assets]
+    tickets = tickets[:limit_tickets]
+
+    jobs: list[dict] = []
+    seen: set = set()
+    skipped: list[dict] = []
+    skipped_count = 0
+    errors: list[dict] = []
+    for t in tickets:
+        tinfo = {"ticket_id": t["id"], "ticket_number": t.get("number"), "ticket_title": t.get("title")}
+        try:
+            articles = api_get(f"/ticket_articles/by_ticket/{t['id']}")
+        except Exception as e:
+            errors.append({**tinfo, "error": f"Artikel konnten nicht geladen werden: {e}"})
+            continue
+        for a in articles:
+            for att in a.get("attachments", []) or []:
+                att_id = att.get("id")
+                if att_id in seen:
+                    continue
+                seen.add(att_id)
+                entry = {**tinfo, "article_id": a["id"], "attachment_id": att_id, "filename": att.get("filename")}
+                ctype = (att.get("preferences") or {}).get("Content-Type", "")
+                if _attachment_text.detect_kind(att.get("filename"), ctype) is None:
+                    skipped_count += 1
+                    if len(skipped) < FIND_MAX_LISTED_SKIPPED:
+                        skipped.append(entry)
+                    continue
+                jobs.append({"entry": entry, "meta": att})
+
+    def work(job):
+        e = job["entry"]
+        return _extract_attachment(e["ticket_id"], e["article_id"], e["attachment_id"], job["meta"])
+
+    results: list = [None] * len(jobs)
+    pool = ThreadPoolExecutor(max_workers=FIND_WORKERS)
+    try:
+        futures = {pool.submit(work, job): i for i, job in enumerate(jobs)}
+        done, _ = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        for f in done:
+            try:
+                results[futures[f]] = f.result()
+            except Exception as e:
+                results[futures[f]] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    matches: list[dict] = []
+    without_match: list[dict] = []
+    not_checked: list[dict] = []
+    total_hits = 0
+    for job, res in zip(jobs, results):
+        entry = job["entry"]
+        if res is None:
+            not_checked.append(entry)
+            continue
+        if not res.get("ok"):
+            err = {**entry, "error": res.get("error")}
+            if res.get("limit_exceeded"):
+                err["limit_exceeded"] = res["limit_exceeded"]
+            errors.append(err)
+            continue
+        text = res["text"]
+        hits = 0
+        try:
+            it = compiled.finditer(text, timeout=REGEX_TIMEOUT) if is_regex else compiled.finditer(text)
+            for m in it:
+                if m.start() == m.end():
+                    continue
+                hits += 1
+                total_hits += 1
+                if hits > FIND_MAX_MATCHES_PER_ATTACHMENT or len(matches) >= FIND_MAX_MATCHES_TOTAL:
+                    continue
+                hit = {**entry, "match": m.group(0)}
+                section = _section_at(res.get("sections") or [], m.start())
+                if section and section.get("page"):
+                    hit["page"] = section["page"]
+                if section and section.get("sheet"):
+                    hit["sheet"] = section["sheet"]
+                hit["context"] = text[max(0, m.start() - context_chars):m.end() + context_chars]
+                hit["extraction_method"] = res.get("extraction_method")
+                matches.append(hit)
+        except TimeoutError:
+            errors.append({**entry, "error": f"Regex-Suche nach {REGEX_TIMEOUT:g} s abgebrochen (Timeout)", "limit_exceeded": "regex_timeout"})
+            continue
+        if hits == 0:
+            without_match.append({**entry, "extraction_method": res.get("extraction_method")})
+
+    out = {
+        "ticket_query": ticket_query,
+        "pattern": pattern,
+        "regex": is_regex,
+        "tickets_searched": len(tickets),
+        "attachments_checked": sum(1 for r in results if r is not None and r.get("ok")),
+        "match_count": total_hits,
+        "matches": matches,
+        "attachments_without_match": without_match,
+    }
+    if total_hits > len(matches):
+        out["matches_truncated"] = True
+    if errors:
+        out["errors"] = errors
+    if not_checked:
+        out["not_checked"] = not_checked
+        out["not_checked_reason"] = f"Gesamtzeit von {FIND_TOTAL_TIMEOUT:g} s ueberschritten"
+    if skipped_count:
+        out["skipped_unsupported_count"] = skipped_count
+        out["skipped_unsupported"] = skipped
+    return out
+
+
+# ---------------------------------------------------------------------------
 # MCP-Server (low-level): Tool-Liste + Dispatch
 # ---------------------------------------------------------------------------
 # Bewusst der rohe mcp.server.Server statt FastMCP - identisch zu bexio-mcp,
@@ -883,6 +1207,8 @@ TOOL_FUNCS = {
     "get_ticket": get_ticket,
     "list_recent_tickets": list_recent_tickets,
     "download_attachment": download_attachment,
+    "get_attachment_text": get_attachment_text,
+    "find_in_attachments": find_in_attachments,
     "find_invoice_aggregation_tickets": find_invoice_aggregation_tickets,
     "list_overviews": list_overviews,
     "get_open_tickets": get_open_tickets,
@@ -941,6 +1267,42 @@ async def list_tools():
                 "article_id": {"type": "integer"},
                 "attachment_id": {"type": "integer"},
             }, "required": ["ticket_id", "article_id", "attachment_id"]},
+        ),
+        Tool(
+            name="get_attachment_text",
+            description=(
+                "Text eines Anhangs serverseitig extrahieren und als Klartext zurueckgeben (statt Base64, "
+                "funktioniert auch bei grossen PDFs). Unterstuetzt PDF, XLSX, DOCX, CSV, TXT. Read-only. "
+                "PDF-Text pro Seite mit Trenner '--- Seite N ---', Tabellenzeilen zusammengehalten. "
+                "Lange Dokumente seitenweise abrufen: solange truncated=true, mit offset=next_offset erneut aufrufen. "
+                "extraction_method zeigt, wie der Text gewonnen wurde (pdfminer | font_cmap | gid_offset_heuristic; "
+                "gid_offset_heuristic = geraten, Inhalt pruefen). Limits: 25 MB, 200 PDF-Seiten, 30 s pro Datei."
+            ),
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "article_id": {"type": "integer"},
+                "attachment_id": {"type": "integer"},
+                "offset": {"type": "integer", "default": 0, "description": "Startposition im extrahierten Text (Zeichen)"},
+                "max_chars": {"type": "integer", "default": 20000, "description": "Maximal zurueckgegebene Zeichen (hoechstens 50000)"},
+            }, "required": ["ticket_id", "article_id", "attachment_id"]},
+        ),
+        Tool(
+            name="find_in_attachments",
+            description=(
+                "Tickets ueber die Ticketsuche (ticket_query) finden und den Text aller unterstuetzten Anhaenge "
+                "(PDF, XLSX, DOCX, CSV, TXT) nach pattern durchsuchen. Standard: Substring, Gross-/Kleinschreibung egal; "
+                "regex=true fuer regulaere Ausdruecke (max. 200 Zeichen, mit Timeout). Read-only. "
+                "Liefert Treffer mit Ticket, Artikel, Anhang, Seite (PDF) bzw. Blatt (XLSX) und Kontext sowie die "
+                "durchsuchten Anhaenge ohne Treffer, Fehler und uebersprungene Dateien. "
+                "Beispiel: ticket_query='QSD Smart Lock PO', pattern='52.5'."
+            ),
+            inputSchema={"type": "object", "properties": {
+                "ticket_query": {"type": "string", "description": "Zammad-Suchanfrage wie bei search_tickets"},
+                "pattern": {"type": "string", "description": "Suchbegriff (Substring) oder Regex bei regex=true"},
+                "regex": {"type": "boolean", "default": False},
+                "limit_tickets": {"type": "integer", "default": 50, "description": "Maximale Anzahl Tickets (hoechstens 200)"},
+                "context_chars": {"type": "integer", "default": 150, "description": "Kontext vor und nach dem Treffer (hoechstens 1000)"},
+            }, "required": ["ticket_query", "pattern"]},
         ),
         Tool(
             name="find_invoice_aggregation_tickets",
