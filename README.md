@@ -45,6 +45,11 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
 | `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
 | `MCP_HOST_PORT` | nein | `8420` | Port *auf dem Docker-Host* (docker-compose Port-Mapping) |
+| `ATTACHMENT_TEXT_MAX_BYTES` | nein | `26214400` (25 MB) | Maximale Anhangsgrösse für `get_attachment_text` / `find_in_attachments` |
+| `ATTACHMENT_TEXT_MAX_PDF_PAGES` | nein | `200` | Maximale Seitenzahl pro PDF |
+| `ATTACHMENT_TEXT_TIMEOUT` | nein | `30` | Timeout pro Datei in Sekunden (Extraktion wird danach hart beendet) |
+| `ATTACHMENT_TEXT_MAX_MEMORY_MB` | nein | `1024` | Speicherlimit des Extraktionsprozesses (nur Linux/macOS) |
+| `FIND_IN_ATTACHMENTS_TIMEOUT` | nein | `240` | Gesamtzeit für `find_in_attachments`, danach werden restliche Anhänge als `not_checked` gemeldet |
 
 `MCP_HOST`/`MCP_PORT` steuern den Server im Container, `MCP_BIND_ADDR`/`MCP_HOST_PORT` das Port-Mapping nach aussen (docker-compose `ports:`) - getrennt, damit man den Container z.B. nur auf localhost binden und den öffentlichen Zugriff über einen Reverse-Proxy führen kann.
 
@@ -111,6 +116,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `get_pending_reached_tickets` | Pending-Reminder-Tickets, deren Wartezeit abgelaufen ist |
 | `list_overviews` | Ticket-Übersichten/Kategorien auflisten |
 | `download_attachment` | Anhang herunterladen (als base64) |
+| `get_attachment_text` | Text eines Anhangs (PDF, XLSX, DOCX, CSV, TXT) serverseitig extrahieren, mit Paging über `offset`/`max_chars` |
+| `find_in_attachments` | Tickets per Suche finden und alle Anhänge nach einem Begriff (oder Regex) durchsuchen |
 | `find_invoice_aggregation_tickets` | Tickets mit Invoice-Aggregation-Excel-Anhängen |
 | `create_ticket` | Neues Ticket erstellen (Gruppe ist Pflicht, unbekannte Gruppen werden abgelehnt) |
 | `list_groups` | Alle aktiven Gruppen auflisten |
@@ -124,6 +131,38 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `delete_ticket_article` | Ticket-Artikel löschen |
 | `set_article_internal` | Bestehenden Ticket-Artikel auf intern (oder öffentlich) stellen |
 | `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten; mit `attachment_urls` werden PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt (nur oeffentliche http/https-Adressen, max. 20 MB, via `URL_ATTACHMENT_MAX_BYTES` anpassbar) |
+
+## Textextraktion aus Anhängen
+
+`download_attachment` liefert Base64, das bei grösseren PDFs im Client abgeschnitten wird. `get_attachment_text` und `find_in_attachments` extrahieren den Inhalt deshalb auf dem Server und geben nur Klartext zurück.
+
+**get_attachment_text(ticket_id, article_id, attachment_id, offset=0, max_chars=20000)**
+
+- Rückgabe: `filename`, `content_type`, `pages` (PDF), `extraction_method`, `total_chars`, `offset`, `returned_chars`, `truncated`, `next_offset` (falls `truncated`), `text`
+- `max_chars` ist auf 50000 begrenzt. Lange Dokumente mit `offset=next_offset` weiter abrufen, bis `truncated=false`. Das extrahierte Ergebnis wird im Prozess zwischengespeichert, Folgeaufrufe laden die Datei nicht erneut.
+- PDF: pro Seite mit Trenner `--- Seite N ---`, Zeilen nach y gruppiert und nach x sortiert, Tabellenspalten durch drei Leerzeichen getrennt. XLSX: pro Blatt `--- Blatt: Name ---`, Zellen tab-getrennt. DOCX: Absätze und Tabellen in Dokumentreihenfolge, Kopf-/Fusszeilen am Ende.
+- Andere Dateitypen (Bilder, .doc, .xls, ...) werden mit einer klaren Fehlermeldung abgelehnt.
+
+**PDF-Extraktion (`extraction_method`)**
+
+1. `pdfminer` – Standardweg über pdfminer.six.
+2. `font_cmap` – Fallback, wenn der Text Zeichensalat ist (Anteil an `(cid:..)`, Steuerzeichen, Private-Use-Zeichen oder U+FFFD über 20 %). Typisch bei PDFs aus WPS Office: eingebettete TrueType-Subset-Fonts ohne brauchbare ToUnicode-CMap, der Text steht als Glyph-IDs im Content-Stream (`<0027>Tj`). Die eingebetteten Fonts (FontFile2) werden mit fontTools geladen, aus der cmap-Tabelle (bzw. den Glyph-Namen) wird eine Reverse-Map GID → Unicode gebaut und die Content-Streams werden damit dekodiert.
+3. `gid_offset_heuristic` – nur wenn Fallback 1 nichts Brauchbares liefert: GID + 29 = ASCII (Standard-Glyph-Reihenfolge, z.B. `0x0027` → `D`, `0x0003` → Leerzeichen, `0x0013` → `0`). Das ist geraten, das Ergebnis also prüfen.
+
+Die Entscheidung fällt pro Seite. `extraction_method` nennt die unsicherste Methode, die im Dokument nötig war; bei gemischten Dokumenten zeigt `pages_by_method`, welche Seite wie extrahiert wurde.
+
+**find_in_attachments(ticket_query, pattern, regex=false, limit_tickets=50, context_chars=150)**
+
+- Sucht Tickets über die normale Zammad-Ticketsuche und extrahiert alle unterstützten Anhänge aller Artikel. Gleiche Anhänge (identische `attachment_id`) werden nur einmal verarbeitet.
+- Standard: einfacher Substring, Gross-/Kleinschreibung egal (`52.5` sucht wörtlich nach `52.5`). Mit `regex=true` als regulärer Ausdruck (ebenfalls case-insensitive, max. 200 Zeichen, Timeout gegen ReDoS über das Paket `regex`).
+- Rückgabe: `matches` (Ticketnummer, Titel, Artikel, Anhang, Dateiname, Seite bzw. Blatt, Treffer mit Kontext, `extraction_method`), `attachments_without_match`, `errors` (z.B. Limits überschritten), `skipped_unsupported` und gegebenenfalls `not_checked`, damit klar ist, was tatsächlich geprüft wurde.
+- `limit_tickets` ist auf 200 begrenzt, Treffer auf 50 pro Anhang und 500 insgesamt (`match_count` zählt trotzdem alle).
+
+**Sicherheit**
+
+- Beide Tools sind strikt read-only (nur GET-Requests an Zammad).
+- Limits pro Datei: 25 MB, 200 PDF-Seiten, 30 s. Bei Überschreitung wird abgebrochen und das in der Rückgabe gemeldet (`limit_exceeded`: `size`, `pages`, `timeout`, `memory`).
+- Die Extraktion läuft in einem eigenen Python-Prozess mit Timeout und Speicherlimit, damit defekte oder präparierte Dateien den Server nicht blockieren. XLSX/DOCX werden vorher auf die entpackte Grösse geprüft (Zip-Bomben).
 
 ## Typischer Workflow (Invoice Aggregation)
 
