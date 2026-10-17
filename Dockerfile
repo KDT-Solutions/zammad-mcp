@@ -2,6 +2,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Tesseract fuer den OCR-Fallback (Scans, Bilder) mit den Sprachpaketen deu/fra/eng/ita.
+# --no-install-recommends und geleerte apt-Listen halten das Image klein; die Seiten
+# werden mit pypdfium2 gerastert (pip-Wheel), Ghostscript/Poppler sind nicht noetig.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tesseract-ocr tesseract-ocr-deu tesseract-ocr-fra tesseract-ocr-eng tesseract-ocr-ita \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

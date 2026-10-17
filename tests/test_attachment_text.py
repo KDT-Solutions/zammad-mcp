@@ -100,7 +100,9 @@ def test_zip_bomb_limit(monkeypatch):
 def test_detect_kind():
     assert at.detect_kind("a.PDF", "") == "pdf"
     assert at.detect_kind("scan", "application/pdf") == "pdf"
-    assert at.detect_kind("bild.png", "image/png") is None
+    assert at.detect_kind("bild.png", "image/png") == "image"
+    assert at.detect_kind("bild.png", "image/png", b"kein bild") is None
+    assert at.detect_kind("archiv.zip", "application/zip") is None
     assert at.detect_kind("a.doc", "application/msword") is None
     assert at.detect_kind("fake.pdf", "", b"not a pdf") is None
     assert at.detect_kind("fake.xlsx", "", b"%PDF-1.4 ...") == "pdf"
@@ -173,8 +175,9 @@ def test_get_attachment_text_paging(zammad):
 
 
 def test_get_attachment_text_errors(zammad, monkeypatch):
-    r = zm.get_attachment_text(1, 11, 103)
-    assert "nicht unterstuetzt" in r["error"] and zammad == []
+    r = zm.get_attachment_text(1, 11, 103)  # .png, aber keine echten Bilddaten
+    assert "nicht unterstuetzt" in r["error"] and zammad == [103]
+    zammad.clear()
     r = zm.get_attachment_text(2, 11, 101)  # Artikel gehoert zu anderem Ticket
     assert "gehoert nicht zu Ticket 2" in r["error"] and zammad == []
     monkeypatch.setattr(zm, "ATTACHMENT_TEXT_MAX_BYTES", 10)

@@ -25,13 +25,19 @@ als Unterschied ausgeschlossen.
 import asyncio
 import base64
 import bisect
+import hashlib
 import ipaddress
 import json
+import logging
 import os
+import queue
 import re
+import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -902,10 +908,56 @@ FIND_MAX_LISTED_SKIPPED = 100
 REGEX_MAX_LEN = 200
 REGEX_TIMEOUT = 2.0
 
+# OCR (Tesseract) fuer Scans und Bilder. OCR_TIMEOUT_SECONDS ist das Zeitbudget pro
+# Tool-Aufruf; ist es aufgebraucht, wird mit den fertigen Seiten zurueckgegeben und der
+# naechste Aufruf setzt ueber next_page/next_offset fort (fertige Seiten sind gecacht).
+def _env_num(name: str, default, cast=float):
+    """Zahl aus der Umgebung; leer oder ungueltig -> Standardwert (z.B. leere Portainer-Variable)."""
+    try:
+        value = cast(os.environ.get(name, "").strip())
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+OCR_TIMEOUT_SECONDS = _env_num("OCR_TIMEOUT_SECONDS", 50.0)
+OCR_MAX_PAGES = _env_num("OCR_MAX_PAGES", 60, int)
+OCR_DPI = min(_env_num("OCR_DPI", 300, int), 600)
+OCR_LANGS = os.environ.get("OCR_LANGS", "").strip() or "deu+fra+eng+ita"
+if not re.match(r"^[A-Za-z_]+(\+[A-Za-z_]+)*$", OCR_LANGS):
+    OCR_LANGS = "deu+fra+eng+ita"
+# Pixel-Limit gegen Decompression-Bombs (A4 bei 300 dpi sind ca. 8.7 Mio. Pixel)
+OCR_MAX_IMAGE_PIXELS = _env_num("OCR_MAX_IMAGE_PIXELS", 100_000_000, int)
+OCR_MAX_MEMORY_MB = _env_num("OCR_MAX_MEMORY_MB", 2048, int)
+OCR_MAX_PARALLEL = _env_num("OCR_MAX_PARALLEL", 2, int)
+OCR_CACHE_DIR = os.environ.get("OCR_CACHE_DIR", "").strip()
+OCR_CACHE_TTL_HOURS = _env_num("OCR_CACHE_TTL_HOURS", 24.0)
+OCR_MODES = ("auto", "force", "off")
+
 _EXTRACT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachment_text.py")
 _TEXT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _TEXT_CACHE_MAX = 16
 _TEXT_CACHE_LOCK = threading.Lock()
+# Rohdaten der zuletzt geladenen Anhaenge, damit OCR-Folgeaufrufe nicht neu herunterladen
+_DATA_CACHE: "OrderedDict[tuple, bytes]" = OrderedDict()
+_DATA_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# OCR-Text pro Seite (In-Memory-LRU, optional zusaetzlich auf Disk)
+_OCR_MEM: "OrderedDict[tuple, str]" = OrderedDict()
+_OCR_MEM_MAX_CHARS = 20_000_000
+_OCR_MEM_CHARS = 0
+_OCR_LOCK = threading.Lock()
+_OCR_SEMAPHORE = threading.BoundedSemaphore(max(1, OCR_MAX_PARALLEL))
+_OCR_LAST_PRUNE = 0.0
+
+# Log: nie OCR-Text, nur Seitenzahl, Dauer und Zeichenanzahl. stderr, weil stdout im
+# stdio-Modus der MCP-Kanal ist.
+_log = logging.getLogger("zammad_mcp.ocr")
+if not _log.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    _log.addHandler(_handler)
+    _log.setLevel(logging.INFO)
+    _log.propagate = False
 
 
 def _attachment_meta(ticket_id: int, article_id: int, attachment_id: int) -> dict:
@@ -946,7 +998,8 @@ class _AttachmentLimit(Exception):
 
 def _run_extraction(data: bytes, kind: str) -> dict:
     """Extraktion im eigenen Prozess mit hartem Timeout (Prozess wird dann beendet)."""
-    cmd = [sys.executable, "-I", _EXTRACT_WORKER, kind, str(ATTACHMENT_TEXT_MAX_PDF_PAGES), str(ATTACHMENT_TEXT_MAX_MEMORY_MB)]
+    cmd = [sys.executable, "-I", _EXTRACT_WORKER, kind, str(ATTACHMENT_TEXT_MAX_PDF_PAGES),
+           str(ATTACHMENT_TEXT_MAX_MEMORY_MB), str(OCR_MAX_IMAGE_PIXELS)]
     try:
         proc = subprocess.run(cmd, input=data, capture_output=True, timeout=ATTACHMENT_TEXT_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -992,6 +1045,8 @@ def _extract_attachment(ticket_id: int, article_id: int, attachment_id: int, met
         return {**info, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
     result = {**info, "size_bytes": len(data), "kind": kind, **_run_extraction(data, kind)}
+    if result.get("ok") and kind in _attachment_text.PAGED_KINDS:
+        _data_cache_put(key, data)
     if result.get("ok"):
         with _TEXT_CACHE_LOCK:
             _TEXT_CACHE[key] = result
@@ -1003,42 +1058,392 @@ def _extract_attachment(ticket_id: int, article_id: int, attachment_id: int, met
 def _unsupported_msg(info: dict) -> str:
     return (
         f"Dateityp nicht unterstuetzt: {info.get('filename')} ({info.get('content_type') or 'unbekannt'}). "
-        f"Unterstuetzt: PDF, XLSX, DOCX, CSV, TXT"
+        f"Unterstuetzt: PDF, XLSX, DOCX, CSV, TXT sowie PNG, JPEG, TIFF (per OCR)"
     )
 
 
-def get_attachment_text(ticket_id: int, article_id: int, attachment_id: int, offset: int = 0, max_chars: int = 20000) -> dict:
-    """Text eines Anhangs serverseitig extrahieren und seitenweise (offset/max_chars) zurueckgeben."""
-    res = _extract_attachment(ticket_id, article_id, attachment_id)
-    if not res.get("ok"):
-        out = {k: res.get(k) for k in ("filename", "content_type", "size_bytes", "pages") if res.get(k) is not None}
-        out["error"] = res.get("error")
-        if res.get("limit_exceeded"):
-            out["limit_exceeded"] = res["limit_exceeded"]
-        return out
-    text = res["text"]
+def _data_cache_put(key: tuple, data: bytes) -> None:
+    if len(data) > _DATA_CACHE_MAX_BYTES:
+        return
+    with _TEXT_CACHE_LOCK:
+        _DATA_CACHE[key] = data
+        _DATA_CACHE.move_to_end(key)
+        while sum(len(v) for v in _DATA_CACHE.values()) > _DATA_CACHE_MAX_BYTES:
+            _DATA_CACHE.popitem(last=False)
+
+
+def _attachment_bytes(ticket_id: int, article_id: int, attachment_id: int) -> bytes:
+    key = (int(ticket_id), int(article_id), int(attachment_id))
+    with _TEXT_CACHE_LOCK:
+        if key in _DATA_CACHE:
+            _DATA_CACHE.move_to_end(key)
+            return _DATA_CACHE[key]
+    data, _ = _download_attachment_limited(ticket_id, article_id, attachment_id)
+    _data_cache_put(key, data)
+    return data
+
+
+# --- OCR-Cache -------------------------------------------------------------
+# Schluessel = IDs + Seite + OCR-Einstellungen. Auf Disk nur als SHA-256 dieses
+# Schluessels (nie Anhangnamen), Dateien mit 0600, Verzeichnis mit 0700.
+
+def _ocr_key(ticket_id, article_id, attachment_id, page) -> tuple:
+    return (int(ticket_id), int(article_id), int(attachment_id), int(page), OCR_DPI, OCR_LANGS)
+
+
+def _ocr_cache_path(key: tuple) -> str:
+    digest = hashlib.sha256(":".join(str(k) for k in key).encode("utf-8")).hexdigest()
+    return os.path.join(OCR_CACHE_DIR, f"{digest}.json")
+
+
+def _ocr_mem_put(key: tuple, text: str) -> None:
+    global _OCR_MEM_CHARS
+    with _OCR_LOCK:
+        if key in _OCR_MEM:
+            _OCR_MEM_CHARS -= len(_OCR_MEM.pop(key))
+        _OCR_MEM[key] = text
+        _OCR_MEM_CHARS += len(text)
+        while _OCR_MEM_CHARS > _OCR_MEM_MAX_CHARS and len(_OCR_MEM) > 1:
+            _, old = _OCR_MEM.popitem(last=False)
+            _OCR_MEM_CHARS -= len(old)
+
+
+def _ocr_cache_get(key: tuple) -> str | None:
+    with _OCR_LOCK:
+        if key in _OCR_MEM:
+            _OCR_MEM.move_to_end(key)
+            return _OCR_MEM[key]
+    if not OCR_CACHE_DIR:
+        return None
+    path = _ocr_cache_path(key)
+    try:
+        if time.time() - os.stat(path).st_mtime > OCR_CACHE_TTL_HOURS * 3600:
+            os.remove(path)
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            text = json.load(f)["text"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    _ocr_mem_put(key, text)
+    return text
+
+
+def _ocr_cache_prune() -> None:
+    """Abgelaufene Disk-Cache-Dateien entfernen (hoechstens alle 10 Minuten)."""
+    global _OCR_LAST_PRUNE
+    now = time.time()
+    if now - _OCR_LAST_PRUNE < 600:
+        return
+    _OCR_LAST_PRUNE = now
+    try:
+        for entry in os.scandir(OCR_CACHE_DIR):
+            if entry.name.endswith((".json", ".tmp")) and now - entry.stat().st_mtime > OCR_CACHE_TTL_HOURS * 3600:
+                os.remove(entry.path)
+    except OSError:
+        pass
+
+
+def _ocr_cache_put(key: tuple, text: str) -> None:
+    _ocr_mem_put(key, text)
+    if not OCR_CACHE_DIR:
+        return
+    path = _ocr_cache_path(key)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(OCR_CACHE_DIR, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            os.write(fd, json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError as e:
+        _log.warning("OCR-Cache nicht schreibbar: %s", type(e).__name__)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    _ocr_cache_prune()
+
+
+# --- OCR-Lauf --------------------------------------------------------------
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _run_ocr(data: bytes, kind: str, pages: list[int], deadline: float, on_page) -> dict:
+    """OCR-Worker starten und Seitenergebnisse bis zur deadline einsammeln.
+    on_page(msg) wird pro fertiger Seite aufgerufen; gibt sie True zurueck, wird abgebrochen.
+    Rueckgabe: {"timed_out": bool, "fatal": str|None}."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _OCR_SEMAPHORE.acquire(timeout=remaining):
+        return {"timed_out": True, "fatal": None}
+    tmpdir = None
+    proc = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="zammad-ocr-")
+        cmd = [sys.executable, "-I", _EXTRACT_WORKER, "ocr", kind, str(OCR_DPI), OCR_LANGS,
+               str(OCR_MAX_IMAGE_PIXELS), str(OCR_MAX_MEMORY_MB), tmpdir, ",".join(str(p) for p in pages)]
+        # OMP_THREAD_LIMIT=1: Tesseract-OpenMP-Threads in parallelen Workern bremsen sich
+        # gegenseitig massiv aus (gemessen: 0.4 s -> 30 s pro Seite bei 4 parallelen Jobs)
+        env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=env, start_new_session=(os.name == "posix"))
+        lines: queue.Queue = queue.Queue()
+
+        def feed():
+            try:
+                proc.stdin.write(data)
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        def read():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=feed, daemon=True).start()
+        threading.Thread(target=read, daemon=True).start()
+        fatal = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"timed_out": True, "fatal": fatal}
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                return {"timed_out": True, "fatal": fatal}
+            if line is None:
+                return {"timed_out": False, "fatal": fatal or "OCR-Prozess unerwartet beendet"}
+            try:
+                msg = json.loads(line.decode("utf-8"))
+            except ValueError:
+                continue
+            if "fatal" in msg:
+                fatal = msg["fatal"]
+            elif msg.get("done"):
+                return {"timed_out": False, "fatal": fatal}
+            elif "page" in msg and on_page(msg):
+                return {"timed_out": False, "fatal": None}
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            for stream in (proc.stdin, proc.stdout):
+                try:
+                    if stream:
+                        stream.close()
+                except OSError:
+                    pass
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        _OCR_SEMAPHORE.release()
+
+
+_METHOD_RANK = {"none": 0, "pdfminer": 1, "font_cmap": 2, "gid_offset_heuristic": 3}
+
+
+def _load_document(ticket_id: int, article_id: int, attachment_id: int, meta: dict | None = None,
+                   ocr: str = "auto", page_from: int | None = None, page_to: int | None = None,
+                   deadline: float | None = None, stop_after_chars: int | None = None) -> dict:
+    """Normale Extraktion plus seitenweise OCR (Scans, Bilder) innerhalb des Zeitbudgets.
+    Fuer PDFs/Bilder enthaelt das Ergebnis page_texts {Seite: Text} fuer page_from bis zur
+    letzten fertigen Seite; next_page ist gesetzt, wenn noch Seiten fehlen."""
+    ocr = (ocr or "auto").strip().lower()
+    if ocr not in OCR_MODES:
+        raise ValueError(f"ocr muss 'auto', 'force' oder 'off' sein, nicht '{ocr}'")
+    if deadline is None:
+        deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
+    started = time.monotonic()
+    base = _extract_attachment(ticket_id, article_id, attachment_id, meta)
+    if not base.get("ok") or base.get("kind") not in _attachment_text.PAGED_KINDS:
+        return {**base, "paged": False}
+
+    n = int(base["pages"])
+    pf = 1 if page_from is None else int(page_from)
+    if pf < 1 or pf > n:
+        return {"ok": False, "filename": base.get("filename"), "content_type": base.get("content_type"),
+                "pages": n, "error": f"page_from={pf} liegt ausserhalb von 1..{n}"}
+    pt = n if page_to is None else min(max(int(page_to), pf), n)
+
+    base_texts = base["page_texts"]
+    base_methods = base["page_methods"]
+
+    def needs_ocr(p: int) -> bool:
+        if ocr == "off":
+            return False
+        if ocr == "force":
+            return True
+        return _attachment_text.meaningful_chars(base_texts[p - 1]) < _attachment_text.OCR_MIN_CHARS
+
+    candidates = [p for p in range(pf, pt + 1) if needs_ocr(p)]
+    allowed = [p for p in candidates if p <= OCR_MAX_PAGES]
+    doc = {
+        "ok": True, "paged": True, "kind": base["kind"], "filename": base.get("filename"),
+        "content_type": base.get("content_type"), "pages": n, "page_from": pf, "page_to": pt,
+        "base_method": base.get("extraction_method"), "page_texts": {}, "page_methods": {},
+        "ocr_pages": [], "ocr_failed_pages": [], "ocr_skipped_pages": [p for p in candidates if p > OCR_MAX_PAGES],
+        "ocr_error": None, "next_page": None,
+    }
+    if base["kind"] == "image" and ocr == "off":
+        doc["ocr_error"] = "OCR ist ausgeschaltet (ocr='off'), Bilder haben keine Textebene"
+
+    ocr_text: dict[int, str] = {}
+    for p in allowed:
+        cached = _ocr_cache_get(_ocr_key(ticket_id, article_id, attachment_id, p))
+        if cached is not None:
+            ocr_text[p] = cached
+    waiting = {p for p in allowed if p not in ocr_text}
+    failed: set = set()
+    state = {"next": pf, "chars": 0}
+
+    def advance() -> bool:
+        """Fertige Seiten in Reihenfolge uebernehmen; True, wenn genug Text vorliegt."""
+        while state["next"] <= pt:
+            p = state["next"]
+            if p in waiting and p not in ocr_text and p not in failed:
+                break
+            if p in ocr_text:
+                text, method = ocr_text[p], "ocr"
+                doc["ocr_pages"].append(p)
+            else:
+                text, method = base_texts[p - 1], base_methods[p - 1]
+                if p in failed:
+                    doc["ocr_failed_pages"].append(p)
+            doc["page_texts"][p] = text
+            doc["page_methods"][p] = method
+            state["chars"] += len(f"--- Seite {p} ---\n") + len(text) + 2
+            state["next"] += 1
+        return stop_after_chars is not None and state["chars"] > stop_after_chars
+
+    if not advance() and state["next"] <= pt and waiting:
+        try:
+            data = _attachment_bytes(ticket_id, article_id, attachment_id)
+        except Exception as e:
+            data = None
+            doc["ocr_error"] = f"Anhang fuer OCR nicht ladbar: {type(e).__name__}"
+        if data is not None:
+            done_this_call = []
+
+            def on_page(msg: dict) -> bool:
+                p = int(msg["page"])
+                if "error" in msg:
+                    failed.add(p)
+                    _log.info("OCR Seite %d: Fehler nach %.1f s", p, float(msg.get("seconds", 0)))
+                else:
+                    ocr_text[p] = msg.get("text", "")
+                    _ocr_cache_put(_ocr_key(ticket_id, article_id, attachment_id, p), ocr_text[p])
+                    _log.info("OCR Seite %d: %.1f s, %d Zeichen", p, float(msg.get("seconds", 0)), len(ocr_text[p]))
+                done_this_call.append(p)
+                return advance()
+
+            ocr_start = time.monotonic()
+            pending = [p for p in allowed if p in waiting and p >= state["next"]]
+            res = _run_ocr(data, base["kind"], pending, deadline, on_page)
+            if res.get("fatal"):
+                doc["ocr_error"] = res["fatal"]
+                waiting.clear()  # restliche Seiten ohne OCR uebernehmen
+                advance()
+            elif res.get("timed_out") and not done_this_call and state["next"] <= pt:
+                # Eine einzelne Seite hat das ganze Budget verbraucht: als fehlgeschlagen
+                # markieren, damit der naechste Aufruf nicht wieder an ihr haengen bleibt.
+                if time.monotonic() - ocr_start >= 0.8 * OCR_TIMEOUT_SECONDS:
+                    failed.add(state["next"])
+                    advance()
+    if state["next"] <= pt:
+        doc["next_page"] = state["next"]
+
+    methods = list(doc["page_methods"].values())
+    if methods and all(m == "ocr" for m in methods):
+        doc["extraction_method"] = "ocr"
+    elif "ocr" in methods:
+        doc["extraction_method"] = "mixed"
+    else:
+        non_ocr = [m for m in methods if m != "ocr"] or [base.get("extraction_method") or "none"]
+        doc["extraction_method"] = max(non_ocr, key=lambda m: _METHOD_RANK.get(m, 0))
+    by_method: dict[str, list[int]] = {}
+    for p, m in doc["page_methods"].items():
+        by_method.setdefault(m, []).append(p)
+    doc["pages_by_method"] = by_method
+    doc["seconds"] = round(time.monotonic() - started, 1)
+    return doc
+
+
+def get_attachment_text(ticket_id: int, article_id: int, attachment_id: int, offset: int = 0, max_chars: int = 20000,
+                        ocr: str = "auto", page_from: int | None = None, page_to: int | None = None) -> dict:
+    """Text eines Anhangs serverseitig extrahieren (bei Scans/Bildern per OCR) und
+    seitenweise (page_from/page_to) bzw. zeichenweise (offset/max_chars) zurueckgeben."""
+    deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
     offset = max(0, int(offset or 0))
     max_chars = min(max(1, int(max_chars or 20000)), ATTACHMENT_TEXT_MAX_CHARS)
-    part = text[offset:offset + max_chars]
-    truncated = offset + len(part) < len(text)
+    doc = _load_document(ticket_id, article_id, attachment_id, ocr=ocr, page_from=page_from, page_to=page_to,
+                         deadline=deadline, stop_after_chars=offset + max_chars + 2)
+    if not doc.get("ok"):
+        out = {k: doc.get(k) for k in ("filename", "content_type", "size_bytes", "pages") if doc.get(k) is not None}
+        out["error"] = doc.get("error")
+        if doc.get("limit_exceeded"):
+            out["limit_exceeded"] = doc["limit_exceeded"]
+        return out
+
     out = {
-        "filename": res.get("filename"),
-        "content_type": res.get("content_type"),
-        "extraction_method": res.get("extraction_method"),
+        "filename": doc.get("filename"),
+        "content_type": doc.get("content_type"),
+        "extraction_method": doc.get("extraction_method"),
     }
-    if res.get("kind") == "pdf":
-        out["pages"] = res.get("pages")
-        if len(res.get("pages_by_method") or {}) > 1:
-            out["pages_by_method"] = res["pages_by_method"]
+    if doc["paged"]:
+        text, _ = _attachment_text.compose_pages(doc["page_texts"])
+        out["pages"] = doc["pages"]
+        out["page_from"] = doc["page_from"]
+        out["page_to"] = doc["page_to"]
+        out["ocr_pages"] = doc["ocr_pages"]
+        if len(doc["pages_by_method"]) > 1:
+            out["pages_by_method"] = doc["pages_by_method"]
+        for k in ("ocr_failed_pages", "ocr_skipped_pages"):
+            if doc[k]:
+                out[k] = doc[k]
+        if doc["ocr_skipped_pages"]:
+            out["ocr_skipped_reason"] = f"OCR ist auf die ersten {OCR_MAX_PAGES} Seiten begrenzt (OCR_MAX_PAGES)"
+        if doc["ocr_error"]:
+            out["ocr_error"] = doc["ocr_error"]
+    else:
+        text = doc["text"]
+        if page_from is not None or page_to is not None:
+            out["note"] = "page_from/page_to gelten nur fuer PDFs und Bilder, hier ignoriert"
+
+    part = text[offset:offset + max_chars]
+    more_chars = offset + len(part) < len(text)
+    next_page = doc.get("next_page") if doc["paged"] else None
     out.update({
         "total_chars": len(text),
         "offset": offset,
         "returned_chars": len(part),
-        "truncated": truncated,
+        "truncated": bool(more_chars or next_page),
     })
-    if truncated:
+    if more_chars:
         out["next_offset"] = offset + len(part)
-    if res.get("text_limit_reached"):
+    elif next_page:
+        # Text bis hier vollstaendig; restliche Seiten mit page_from=next_page abrufen
+        out["next_page"] = next_page
+        out["ocr_incomplete"] = True
+        out["hint"] = f"OCR-Zeitbudget ({OCR_TIMEOUT_SECONDS:g} s) aufgebraucht, mit page_from={next_page} fortsetzen"
+    if doc.get("text_limit_reached"):
         out["text_limit_reached"] = True
     out["text"] = part
     return out
@@ -1070,8 +1475,13 @@ def _section_at(sections: list[dict], pos: int) -> dict | None:
     return sections[idx] if idx >= 0 else None
 
 
-def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, limit_tickets: int = 50, context_chars: int = 150) -> dict:
-    """Tickets per Ticketsuche finden und alle unterstuetzten Anhaenge nach pattern durchsuchen."""
+def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, limit_tickets: int = 50,
+                        context_chars: int = 150, ocr: str = "off") -> dict:
+    """Tickets per Ticketsuche finden und alle unterstuetzten Anhaenge nach pattern durchsuchen.
+    ocr='auto' durchsucht auch Scans und Bilder per OCR (teuer, nutzt den OCR-Cache)."""
+    ocr = (ocr or "off").strip().lower()
+    if ocr not in OCR_MODES:
+        raise ValueError(f"ocr muss 'auto', 'force' oder 'off' sein, nicht '{ocr}'")
     compiled, is_regex = _compile_pattern(pattern, bool(regex))
     limit_tickets = min(max(1, int(limit_tickets or 50)), FIND_MAX_TICKETS)
     context_chars = min(max(0, int(context_chars if context_chars is not None else 150)), 1000)
@@ -1105,22 +1515,27 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
                 seen.add(att_id)
                 entry = {**tinfo, "article_id": a["id"], "attachment_id": att_id, "filename": att.get("filename")}
                 ctype = (att.get("preferences") or {}).get("Content-Type", "")
-                if _attachment_text.detect_kind(att.get("filename"), ctype) is None:
+                kind = _attachment_text.detect_kind(att.get("filename"), ctype)
+                if kind is None or (kind == "image" and ocr == "off"):
                     skipped_count += 1
                     if len(skipped) < FIND_MAX_LISTED_SKIPPED:
-                        skipped.append(entry)
+                        reason = "Dateityp nicht unterstuetzt" if kind is None else "Bild, nur mit ocr='auto' durchsuchbar"
+                        skipped.append({**entry, "reason": reason})
                     continue
                 jobs.append({"entry": entry, "meta": att})
 
     def work(job):
         e = job["entry"]
-        return _extract_attachment(e["ticket_id"], e["article_id"], e["attachment_id"], job["meta"])
+        ocr_deadline = min(deadline, time.monotonic() + OCR_TIMEOUT_SECONDS)
+        return _load_document(e["ticket_id"], e["article_id"], e["attachment_id"], job["meta"],
+                              ocr=ocr, deadline=ocr_deadline)
 
     results: list = [None] * len(jobs)
     pool = ThreadPoolExecutor(max_workers=FIND_WORKERS)
     try:
         futures = {pool.submit(work, job): i for i, job in enumerate(jobs)}
-        done, _ = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        # kleine Reserve: laufende OCR-Jobs geben spaetestens an der deadline zurueck
+        done, _ = wait(futures, timeout=max(0.0, deadline - time.monotonic()) + 5)
         for f in done:
             try:
                 results[futures[f]] = f.result()
@@ -1132,6 +1547,7 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
     matches: list[dict] = []
     without_match: list[dict] = []
     not_checked: list[dict] = []
+    ocr_incomplete: list[dict] = []
     total_hits = 0
     for job, res in zip(jobs, results):
         entry = job["entry"]
@@ -1144,7 +1560,13 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
                 err["limit_exceeded"] = res["limit_exceeded"]
             errors.append(err)
             continue
-        text = res["text"]
+        if res.get("paged"):
+            text, sections = _attachment_text.compose_pages(res["page_texts"])
+            ocr_pages = set(res["ocr_pages"])
+            if res.get("next_page"):
+                ocr_incomplete.append({**entry, "next_page": res["next_page"], "pages": res["pages"]})
+        else:
+            text, sections, ocr_pages = res["text"], res.get("sections") or [], set()
         hits = 0
         try:
             it = compiled.finditer(text, timeout=REGEX_TIMEOUT) if is_regex else compiled.finditer(text)
@@ -1156,9 +1578,11 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
                 if hits > FIND_MAX_MATCHES_PER_ATTACHMENT or len(matches) >= FIND_MAX_MATCHES_TOTAL:
                     continue
                 hit = {**entry, "match": m.group(0)}
-                section = _section_at(res.get("sections") or [], m.start())
+                section = _section_at(sections, m.start())
                 if section and section.get("page"):
                     hit["page"] = section["page"]
+                    if section["page"] in ocr_pages:
+                        hit["ocr"] = True
                 if section and section.get("sheet"):
                     hit["sheet"] = section["sheet"]
                 hit["context"] = text[max(0, m.start() - context_chars):m.end() + context_chars]
@@ -1168,12 +1592,20 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
             errors.append({**entry, "error": f"Regex-Suche nach {REGEX_TIMEOUT:g} s abgebrochen (Timeout)", "limit_exceeded": "regex_timeout"})
             continue
         if hits == 0:
-            without_match.append({**entry, "extraction_method": res.get("extraction_method")})
+            miss = {**entry, "extraction_method": res.get("extraction_method")}
+            if res.get("paged"):
+                empty = [p for p, t in res["page_texts"].items()
+                         if _attachment_text.meaningful_chars(t) < _attachment_text.OCR_MIN_CHARS]
+                if empty and ocr == "off":
+                    miss["pages_without_text"] = empty[:50]
+                    miss["hint"] = "Seiten ohne Textebene (Scan?), mit ocr='auto' durchsuchbar"
+            without_match.append(miss)
 
     out = {
         "ticket_query": ticket_query,
         "pattern": pattern,
         "regex": is_regex,
+        "ocr": ocr,
         "tickets_searched": len(tickets),
         "attachments_checked": sum(1 for r in results if r is not None and r.get("ok")),
         "match_count": total_hits,
@@ -1184,6 +1616,10 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
         out["matches_truncated"] = True
     if errors:
         out["errors"] = errors
+    if ocr_incomplete:
+        out["ocr_incomplete"] = ocr_incomplete
+        out["ocr_incomplete_hint"] = ("OCR-Zeitbudget pro Anhang aufgebraucht; fertige Seiten sind gecacht, "
+                                      "ein erneuter Aufruf macht weiter (oder get_attachment_text mit page_from=next_page)")
     if not_checked:
         out["not_checked"] = not_checked
         out["not_checked_reason"] = f"Gesamtzeit von {FIND_TOTAL_TIMEOUT:g} s ueberschritten"
@@ -1272,11 +1708,15 @@ async def list_tools():
             name="get_attachment_text",
             description=(
                 "Text eines Anhangs serverseitig extrahieren und als Klartext zurueckgeben (statt Base64, "
-                "funktioniert auch bei grossen PDFs). Unterstuetzt PDF, XLSX, DOCX, CSV, TXT. Read-only. "
+                "funktioniert auch bei grossen PDFs). Unterstuetzt PDF, XLSX, DOCX, CSV, TXT sowie Scans und Bilder "
+                "(PNG, JPEG, mehrseitiges TIFF) per OCR. Read-only. "
                 "PDF-Text pro Seite mit Trenner '--- Seite N ---', Tabellenzeilen zusammengehalten. "
-                "Lange Dokumente seitenweise abrufen: solange truncated=true, mit offset=next_offset erneut aufrufen. "
-                "extraction_method zeigt, wie der Text gewonnen wurde (pdfminer | font_cmap | gid_offset_heuristic; "
-                "gid_offset_heuristic = geraten, Inhalt pruefen). Limits: 25 MB, 200 PDF-Seiten, 30 s pro Datei."
+                "ocr='auto' (Standard) liest Seiten ohne Textebene per OCR, 'force' alle Seiten, 'off' keine. "
+                "OCR ist langsam (einige Sekunden pro Seite) und laeuft mit Zeitbudget: solange truncated=true, "
+                "mit offset=next_offset bzw. page_from=next_page erneut aufrufen, fertige Seiten sind gecacht. "
+                "page_from/page_to waehlen einzelne Seiten. extraction_method: pdfminer | font_cmap | "
+                "gid_offset_heuristic (geraten, Inhalt pruefen) | ocr | mixed; ocr_pages listet die OCR-Seiten. "
+                "Limits: 25 MB, 200 Seiten, 30 s fuer die normale Extraktion."
             ),
             inputSchema={"type": "object", "properties": {
                 "ticket_id": {"type": "integer"},
@@ -1284,6 +1724,9 @@ async def list_tools():
                 "attachment_id": {"type": "integer"},
                 "offset": {"type": "integer", "default": 0, "description": "Startposition im extrahierten Text (Zeichen)"},
                 "max_chars": {"type": "integer", "default": 20000, "description": "Maximal zurueckgegebene Zeichen (hoechstens 50000)"},
+                "ocr": {"type": "string", "enum": ["auto", "force", "off"], "default": "auto", "description": "auto = nur Seiten ohne Textebene per OCR, force = alle Seiten, off = kein OCR"},
+                "page_from": {"type": "integer", "description": "Erste Seite (PDF/TIFF), Standard 1"},
+                "page_to": {"type": "integer", "description": "Letzte Seite (PDF/TIFF), Standard letzte Seite"},
             }, "required": ["ticket_id", "article_id", "attachment_id"]},
         ),
         Tool(
@@ -1292,6 +1735,7 @@ async def list_tools():
                 "Tickets ueber die Ticketsuche (ticket_query) finden und den Text aller unterstuetzten Anhaenge "
                 "(PDF, XLSX, DOCX, CSV, TXT) nach pattern durchsuchen. Standard: Substring, Gross-/Kleinschreibung egal; "
                 "regex=true fuer regulaere Ausdruecke (max. 200 Zeichen, mit Timeout). Read-only. "
+                "ocr='auto' durchsucht auch Scans und Bilder per OCR (langsam, Standard 'off'). "
                 "Liefert Treffer mit Ticket, Artikel, Anhang, Seite (PDF) bzw. Blatt (XLSX) und Kontext sowie die "
                 "durchsuchten Anhaenge ohne Treffer, Fehler und uebersprungene Dateien. "
                 "Beispiel: ticket_query='QSD Smart Lock PO', pattern='52.5'."
@@ -1302,6 +1746,7 @@ async def list_tools():
                 "regex": {"type": "boolean", "default": False},
                 "limit_tickets": {"type": "integer", "default": 50, "description": "Maximale Anzahl Tickets (hoechstens 200)"},
                 "context_chars": {"type": "integer", "default": 150, "description": "Kontext vor und nach dem Treffer (hoechstens 1000)"},
+                "ocr": {"type": "string", "enum": ["auto", "force", "off"], "default": "off", "description": "OCR fuer Scans und Bilder (teuer); 'auto' = nur Seiten ohne Textebene"},
             }, "required": ["ticket_query", "pattern"]},
         ),
         Tool(
