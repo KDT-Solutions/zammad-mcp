@@ -30,10 +30,10 @@ services:
     # volumes:
     #   - zammad-mcp-ocr-cache:/cache/ocr
     ports:
-      # Standardmässig nur auf localhost binden - öffentlicher Zugriff läuft
-      # über einen Reverse-Proxy (Plesk/nginx) mit TLS. Bind-Adresse und Port
-      # sind über Env-Variablen überschreibbar (z.B. für Portainer).
-      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8420}:8000"
+      # Auf allen Interfaces gebunden (Standard wie bei allen MCP-Stacks), damit
+      # NPM den Dienst ueber <Host-IP>:8420 erreicht. Die Zugriffskontrolle ist das
+      # Bearer-Token, TLS macht der Reverse-Proxy. Ueber MCP_BIND_ADDR einschraenkbar.
+      - "${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8420}:8000"
 
 # volumes:
 #   zammad-mcp-ocr-cache:
