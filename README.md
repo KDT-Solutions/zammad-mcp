@@ -50,6 +50,15 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `ATTACHMENT_TEXT_TIMEOUT` | nein | `30` | Timeout pro Datei in Sekunden (Extraktion wird danach hart beendet) |
 | `ATTACHMENT_TEXT_MAX_MEMORY_MB` | nein | `1024` | Speicherlimit des Extraktionsprozesses (nur Linux/macOS) |
 | `FIND_IN_ATTACHMENTS_TIMEOUT` | nein | `240` | Gesamtzeit für `find_in_attachments`, danach werden restliche Anhänge als `not_checked` gemeldet |
+| `OCR_TIMEOUT_SECONDS` | nein | `50` | Zeitbudget pro Aufruf für OCR (inkl. Download und normaler Extraktion); danach Rückgabe mit `next_page` |
+| `OCR_MAX_PAGES` | nein | `60` | OCR nur für die Seiten 1 bis N eines Dokuments, spätere Seiten werden als `ocr_skipped_pages` gemeldet |
+| `OCR_DPI` | nein | `300` | Auflösung beim Rastern der PDF-Seiten (max. 600) |
+| `OCR_LANGS` | nein | `deu+fra+eng+ita` | Tesseract-Sprachen (die Sprachpakete müssen im Image installiert sein) |
+| `OCR_CACHE_DIR` | nein | leer (aus) | Verzeichnis für den Disk-Cache der OCR-Ergebnisse, z.B. ein Volume unter `/cache/ocr` |
+| `OCR_CACHE_TTL_HOURS` | nein | `24` | Gültigkeit der Cache-Einträge (Memory und Disk) in Stunden |
+| `OCR_MAX_IMAGE_PIXELS` | nein | `100000000` | Pixel-Limit pro Bild/Seite gegen Decompression-Bombs; PDF-Seiten werden darunter gerastert |
+| `OCR_MAX_PARALLEL` | nein | `2` | Gleichzeitige OCR-Prozesse |
+| `OCR_MAX_MEMORY_MB` | nein | `2048` | Speicherlimit des OCR-Prozesses (nur Linux/macOS) |
 
 `MCP_HOST`/`MCP_PORT` steuern den Server im Container, `MCP_BIND_ADDR`/`MCP_HOST_PORT` das Port-Mapping nach aussen (docker-compose `ports:`) - getrennt, damit man den Container z.B. nur auf localhost binden und den öffentlichen Zugriff über einen Reverse-Proxy führen kann.
 
@@ -116,8 +125,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `get_pending_reached_tickets` | Pending-Reminder-Tickets, deren Wartezeit abgelaufen ist |
 | `list_overviews` | Ticket-Übersichten/Kategorien auflisten |
 | `download_attachment` | Anhang herunterladen (als base64) |
-| `get_attachment_text` | Text eines Anhangs (PDF, XLSX, DOCX, CSV, TXT) serverseitig extrahieren, mit Paging über `offset`/`max_chars` |
-| `find_in_attachments` | Tickets per Suche finden und alle Anhänge nach einem Begriff (oder Regex) durchsuchen |
+| `get_attachment_text` | Text eines Anhangs (PDF, XLSX, DOCX, CSV, TXT, Scans und Bilder per OCR) serverseitig extrahieren, mit Paging über `offset`/`max_chars` und `page_from`/`page_to` |
+| `find_in_attachments` | Tickets per Suche finden und alle Anhänge nach einem Begriff (oder Regex) durchsuchen, optional inkl. OCR |
 | `find_invoice_aggregation_tickets` | Tickets mit Invoice-Aggregation-Excel-Anhängen |
 | `create_ticket` | Neues Ticket erstellen (Gruppe ist Pflicht, unbekannte Gruppen werden abgelehnt) |
 | `list_groups` | Alle aktiven Gruppen auflisten |
@@ -136,9 +145,10 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 
 `download_attachment` liefert Base64, das bei grösseren PDFs im Client abgeschnitten wird. `get_attachment_text` und `find_in_attachments` extrahieren den Inhalt deshalb auf dem Server und geben nur Klartext zurück.
 
-**get_attachment_text(ticket_id, article_id, attachment_id, offset=0, max_chars=20000)**
+**get_attachment_text(ticket_id, article_id, attachment_id, offset=0, max_chars=20000, ocr="auto", page_from=None, page_to=None)**
 
-- Rückgabe: `filename`, `content_type`, `pages` (PDF), `extraction_method`, `total_chars`, `offset`, `returned_chars`, `truncated`, `next_offset` (falls `truncated`), `text`
+- Rückgabe: `filename`, `content_type`, `pages` (PDF/Bild), `page_from`, `page_to`, `extraction_method`, `ocr_pages`, `total_chars`, `offset`, `returned_chars`, `truncated`, `next_offset` bzw. `next_page` (falls `truncated`), `text`
+- `page_from`/`page_to` wählen gezielt einzelne Seiten (PDF, mehrseitiges TIFF), z.B. `page_from=3, page_to=3`.
 - `max_chars` ist auf 50000 begrenzt. Lange Dokumente mit `offset=next_offset` weiter abrufen, bis `truncated=false`. Das extrahierte Ergebnis wird im Prozess zwischengespeichert, Folgeaufrufe laden die Datei nicht erneut.
 - PDF: pro Seite mit Trenner `--- Seite N ---`, Zeilen nach y gruppiert und nach x sortiert, Tabellenspalten durch drei Leerzeichen getrennt. XLSX: pro Blatt `--- Blatt: Name ---`, Zellen tab-getrennt. DOCX: Absätze und Tabellen in Dokumentreihenfolge, Kopf-/Fusszeilen am Ende.
 - Andere Dateitypen (Bilder, .doc, .xls, ...) werden mit einer klaren Fehlermeldung abgelehnt.
@@ -149,7 +159,22 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 2. `font_cmap` – Fallback, wenn der Text Zeichensalat ist (Anteil an `(cid:..)`, Steuerzeichen, Private-Use-Zeichen oder U+FFFD über 20 %). Typisch bei PDFs aus WPS Office: eingebettete TrueType-Subset-Fonts ohne brauchbare ToUnicode-CMap, der Text steht als Glyph-IDs im Content-Stream (`<0027>Tj`). Die eingebetteten Fonts (FontFile2) werden mit fontTools geladen, aus der cmap-Tabelle (bzw. den Glyph-Namen) wird eine Reverse-Map GID → Unicode gebaut und die Content-Streams werden damit dekodiert.
 3. `gid_offset_heuristic` – nur wenn Fallback 1 nichts Brauchbares liefert: GID + 29 = ASCII (Standard-Glyph-Reihenfolge, z.B. `0x0027` → `D`, `0x0003` → Leerzeichen, `0x0013` → `0`). Das ist geraten, das Ergebnis also prüfen.
 
-Die Entscheidung fällt pro Seite. `extraction_method` nennt die unsicherste Methode, die im Dokument nötig war; bei gemischten Dokumenten zeigt `pages_by_method`, welche Seite wie extrahiert wurde.
+4. `ocr` – Seite per Tesseract gelesen (siehe unten).
+
+Die Entscheidung fällt pro Seite. `extraction_method` nennt die unsicherste Methode, die im Dokument nötig war, bzw. `ocr` (alle zurückgegebenen Seiten per OCR) oder `mixed` (teils OCR, teils Textebene). `pages_by_method` zeigt bei gemischten Dokumenten, welche Seite wie extrahiert wurde, `ocr_pages` listet die OCR-Seiten.
+
+**OCR für Scans und Bilder**
+
+Gescannte PDFs (z.B. vom Netzwerkscanner) und Bilder haben keine Textebene. Dafür gibt es einen OCR-Fallback mit Tesseract (Sprachen deu, fra, eng, ita). PDF-Seiten werden mit pypdfium2 in Graustufen gerastert (Standard 300 dpi).
+
+- `ocr="auto"` (Standard): nur Seiten, deren normale Extraktion weniger als 20 Buchstaben/Ziffern liefert, werden per OCR gelesen.
+- `ocr="force"`: alle Seiten im gewählten Bereich per OCR, z.B. wenn die Textebene eines Scans unbrauchbar ist.
+- `ocr="off"`: kein OCR.
+- Bilder (PNG, JPEG, TIFF inkl. mehrseitiger TIFFs) werden direkt per OCR gelesen, jede TIFF-Seite ist eine Seite.
+
+**Laufzeit:** OCR braucht je nach Seite etwa 2 bis 6 Sekunden. Pro Aufruf gilt ein Zeitbudget (`OCR_TIMEOUT_SECONDS`, Standard 50 s, inkl. Download und normaler Extraktion). Ist es aufgebraucht, kommt die Antwort sofort mit den fertigen Seiten zurück, dazu `truncated=true`, `ocr_incomplete=true` und `next_page`. Der nächste Aufruf mit `page_from=next_page` setzt dort fort. Fertige Seiten sind pro (Ticket, Artikel, Anhang, Seite) gecacht, Folgeaufrufe mit `offset` oder `page_from` lesen sie nicht erneut. Es werden nur so viele Seiten per OCR gelesen, wie für `offset + max_chars` nötig sind. Braucht eine einzelne Seite das ganze Budget, wird sie als `ocr_failed_pages` gemeldet und übersprungen.
+
+**Cache:** In-Memory-LRU, optional zusätzlich auf Disk (`OCR_CACHE_DIR`, z.B. als Volume). Die Dateinamen sind ein SHA-256-Hash aus den IDs, der Seite und den OCR-Einstellungen, nie der Anhangname. Dateien werden mit Rechten 0600 angelegt, das Verzeichnis mit 0700. Einträge laufen nach `OCR_CACHE_TTL_HOURS` (Standard 24 h) ab.
 
 **find_in_attachments(ticket_query, pattern, regex=false, limit_tickets=50, context_chars=150)**
 
@@ -157,11 +182,14 @@ Die Entscheidung fällt pro Seite. `extraction_method` nennt die unsicherste Met
 - Standard: einfacher Substring, Gross-/Kleinschreibung egal (`52.5` sucht wörtlich nach `52.5`). Mit `regex=true` als regulärer Ausdruck (ebenfalls case-insensitive, max. 200 Zeichen, Timeout gegen ReDoS über das Paket `regex`).
 - Rückgabe: `matches` (Ticketnummer, Titel, Artikel, Anhang, Dateiname, Seite bzw. Blatt, Treffer mit Kontext, `extraction_method`), `attachments_without_match`, `errors` (z.B. Limits überschritten), `skipped_unsupported` und gegebenenfalls `not_checked`, damit klar ist, was tatsächlich geprüft wurde.
 - `limit_tickets` ist auf 200 begrenzt, Treffer auf 50 pro Anhang und 500 insgesamt (`match_count` zählt trotzdem alle).
+- `ocr` (Standard `"off"`, weil teuer): mit `"auto"` werden auch Scans und Bilder per OCR durchsucht, Treffer aus OCR-Seiten tragen `"ocr": true`. Mit `"off"` werden Bilder als `skipped_unsupported` gemeldet und PDF-Seiten ohne Textebene bei den Anhängen ohne Treffer als `pages_without_text` aufgeführt. Reicht das Zeitbudget pro Anhang nicht, steht der Anhang in `ocr_incomplete`; ein erneuter Aufruf macht dank Cache dort weiter.
 
 **Sicherheit**
 
 - Beide Tools sind strikt read-only (nur GET-Requests an Zammad).
-- Limits pro Datei: 25 MB, 200 PDF-Seiten, 30 s. Bei Überschreitung wird abgebrochen und das in der Rückgabe gemeldet (`limit_exceeded`: `size`, `pages`, `timeout`, `memory`).
+- Limits pro Datei: 25 MB, 200 Seiten, 30 s für die normale Extraktion. Bei Überschreitung wird abgebrochen und das in der Rückgabe gemeldet (`limit_exceeded`: `size`, `pages`, `timeout`, `memory`, `pixels`).
+- OCR läuft ebenfalls in einem eigenen Prozess (Zeitbudget, Speicherlimit, Pixel-Limit über `PIL.Image.MAX_IMAGE_PIXELS`). Tesseract wird nur mit festen Argumenten aus der Konfiguration aufgerufen, nie über eine Shell. Temporäre Dateien liegen in einem eigenen Verzeichnis, das danach immer gelöscht wird.
+- Im Log stehen bei OCR nur Seitenzahl, Dauer und Zeichenanzahl, nie der erkannte Text.
 - Die Extraktion läuft in einem eigenen Python-Prozess mit Timeout und Speicherlimit, damit defekte oder präparierte Dateien den Server nicht blockieren. XLSX/DOCX werden vorher auf die entpackte Grösse geprüft (Zip-Bomben).
 
 ## Typischer Workflow (Invoice Aggregation)
