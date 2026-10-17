@@ -8,8 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY pyproject.toml ./
 COPY zammad_mcp ./zammad_mcp
 
-ENV MCP_TRANSPORT=http \
-    MCP_HOST=0.0.0.0 \
+ENV MCP_HOST=0.0.0.0 \
     MCP_PORT=8000
 
 # Git-Commit und Version des Builds (von GitHub Actions gesetzt) - get_version

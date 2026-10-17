@@ -16,7 +16,6 @@ services:
       - ZAMMAD_URL=${ZAMMAD_URL}
       - ZAMMAD_TOKEN=${ZAMMAD_TOKEN}
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
-      - MCP_TRANSPORT=http
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
     ports:

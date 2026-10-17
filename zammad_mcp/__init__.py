@@ -2,10 +2,9 @@
 Zammad MCP Server
 Ermöglicht Claude direkten Zugriff auf Zammad Tickets und Anhänge.
 
-Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
-- "stdio" (Standard) - für die lokale Nutzung via uvx/Claude Desktop, unveraendert.
-- "http" - startet den Server als HTTP-Dienst (Streamable HTTP) für den Cloud-Einsatz,
-  z.B. hinter einem Reverse-Proxy. Erfordert MCP_AUTH_TOKEN.
+Laeuft ausschliesslich als HTTP-Dienst (Streamable HTTP) im Docker-Container hinter
+einem Reverse-Proxy und erfordert MCP_AUTH_TOKEN. Ein lokaler Betrieb (stdio/uvx) ist
+nicht vorgesehen.
 
 Alle Instanz-spezifischen Werte (Zammad-URL, Token, Auth-Token) werden ausschliesslich
 über Umgebungsvariablen gesetzt - es sind keine echten Adressen oder Zugangsdaten
@@ -41,7 +40,6 @@ from typing import Any
 
 import httpx
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from . import attachment_text as _attachment_text
@@ -1464,10 +1462,10 @@ async def call_tool(name, arguments):
 # ---------------------------------------------------------------------------
 # Cloud/HTTP-Betrieb
 # ---------------------------------------------------------------------------
-# MCP_TRANSPORT=http aktiviert den Streamable-HTTP-Modus fuer den Cloud-Einsatz
-# (z.B. via Docker/Portainer). Ein statisches Bearer-Token (MCP_AUTH_TOKEN)
-# schuetzt den Endpoint, da er oeffentlich erreichbar ist. Ohne gesetztes
-# MCP_AUTH_TOKEN startet der HTTP-Modus NICHT (fail-safe, kein offener Endpoint).
+# Streamable-HTTP-Betrieb fuer den Cloud-Einsatz (Docker/Portainer). Ein
+# statisches Bearer-Token (MCP_AUTH_TOKEN) schuetzt den Endpoint, da er
+# oeffentlich erreichbar ist. Ohne gesetztes MCP_AUTH_TOKEN startet der Server
+# NICHT (fail-safe, kein offener Endpoint).
 
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
@@ -1507,7 +1505,7 @@ class BearerAuthMiddleware:
 
 
 async def run_http_server():
-    """Streamable-HTTP-Transport für Cloud-/Docker-Betrieb (MCP_TRANSPORT=http),
+    """Streamable-HTTP-Transport für den Cloud-/Docker-Betrieb,
     handverdrahtet identisch zu bexio-mcp (siehe Modul-Docstring)."""
     from starlette.applications import Starlette
     from starlette.routing import Route
@@ -1556,20 +1554,11 @@ async def run_http_server():
 
 
 def main():
-    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
-
-    if transport in ("http", "streamable-http"):
-        if not MCP_AUTH_TOKEN:
-            raise RuntimeError(
-                "MCP_TRANSPORT=http erfordert MCP_AUTH_TOKEN (statisches Bearer-Token) - "
-                "aus Sicherheitsgruenden kein Start ohne Token."
-            )
-        asyncio.run(run_http_server())
-    else:
-        async def _run_stdio():
-            async with stdio_server() as (read_stream, write_stream):
-                await server.run(read_stream, write_stream, server.create_initialization_options())
-        asyncio.run(_run_stdio())
+    if not MCP_AUTH_TOKEN:
+        raise RuntimeError(
+            "MCP_AUTH_TOKEN (statisches Bearer-Token) fehlt - aus Sicherheitsgruenden kein Start ohne Token."
+        )
+    asyncio.run(run_http_server())
 
 
 if __name__ == "__main__":
