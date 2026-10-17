@@ -26,9 +26,14 @@ import sys
 import unicodedata
 import zipfile
 
-SUPPORTED_KINDS = ("pdf", "xlsx", "docx", "csv", "txt")
+SUPPORTED_KINDS = ("pdf", "xlsx", "docx", "csv", "txt", "image")
+# Dokumente mit Seiten (Seitentrenner, page_from/page_to, OCR)
+PAGED_KINDS = ("pdf", "image")
 
-EXTENSION_KINDS = {".pdf": "pdf", ".xlsx": "xlsx", ".xlsm": "xlsx", ".docx": "docx", ".csv": "csv", ".txt": "txt"}
+EXTENSION_KINDS = {
+    ".pdf": "pdf", ".xlsx": "xlsx", ".xlsm": "xlsx", ".docx": "docx", ".csv": "csv", ".txt": "txt",
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".tif": "image", ".tiff": "image",
+}
 CONTENT_TYPE_KINDS = {
     "application/pdf": "pdf",
     "application/x-pdf": "pdf",
@@ -38,7 +43,16 @@ CONTENT_TYPE_KINDS = {
     "text/csv": "csv",
     "application/csv": "csv",
     "text/plain": "txt",
+    "image/png": "image",
+    "image/jpeg": "image",
+    "image/jpg": "image",
+    "image/pjpeg": "image",
+    "image/tiff": "image",
 }
+IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"II*\x00", b"MM\x00*")
+IMAGE_FORMATS = ("PNG", "JPEG", "TIFF", "MPO")
+# Seiten mit weniger "sinnvollen" Zeichen (Buchstaben/Ziffern) gelten als Scan
+OCR_MIN_CHARS = 20
 
 # Obergrenze fuer den extrahierten Text (Schutz vor Speicher-Explosion bei
 # riesigen Tabellen); bei Ueberschreitung wird abgeschnitten und das gemeldet.
@@ -71,6 +85,8 @@ def detect_kind(filename: str = "", content_type: str = "", data: bytes | None =
             return None
         if kind in ("xlsx", "docx") and not data.startswith(b"PK"):
             return None
+        if kind == "image" and not data.startswith(IMAGE_MAGIC):
+            return None
     return kind
 
 
@@ -97,6 +113,24 @@ def garbled_ratio(text: str) -> float:
 
 def is_garbled(text: str) -> bool:
     return garbled_ratio(text) > GARBLED_THRESHOLD
+
+
+def meaningful_chars(text: str) -> int:
+    """Anzahl Buchstaben/Ziffern ohne (cid:N)-Tokens - Mass dafuer, ob eine Seite eine Textebene hat."""
+    return sum(1 for ch in _CID_RE.sub("", text or "") if ch.isalnum())
+
+
+def compose_pages(page_texts: dict[int, str] | list[str], first_page: int = 1) -> tuple[str, list[dict]]:
+    """Seitentexte mit Trenner '--- Seite N ---' zusammensetzen, plus Offsets je Seite."""
+    items = sorted(page_texts.items()) if isinstance(page_texts, dict) else list(enumerate(page_texts, start=first_page))
+    parts, sections, pos = [], [], 0
+    for n, t in items:
+        chunk = f"--- Seite {n} ---\n{t}\n\n"
+        sections.append({"offset": pos, "page": n})
+        parts.append(chunk)
+        pos += len(chunk)
+    text = "".join(parts).rstrip("\n")
+    return (text + "\n" if text else ""), sections
 
 
 def _join_line(fragments: list[tuple[float, float, str, float]]) -> str:
@@ -637,17 +671,11 @@ def extract_pdf(data: bytes, max_pages: int) -> dict:
     for i, m in enumerate(methods, start=1):
         by_method.setdefault(m, []).append(i)
 
-    sections = []
-    parts = []
-    pos = 0
-    for i, t in enumerate(pages, start=1):
-        header = f"--- Seite {i} ---\n"
-        chunk = header + t + "\n\n"
-        sections.append({"offset": pos, "page": i})
-        parts.append(chunk)
-        pos += len(chunk)
+    text, sections = compose_pages(pages)
     result = {
-        "text": "".join(parts).rstrip("\n") + "\n",
+        "text": text,
+        "page_texts": pages,
+        "page_methods": methods,
         "pages": page_count,
         "extraction_method": overall,
         "pages_by_method": by_method,
@@ -780,9 +808,49 @@ def extract_text_file(data: bytes) -> dict:
     return {"text": text, "sections": []}
 
 
-def extract(data: bytes, kind: str, max_pages: int = 200) -> dict:
+def _open_image(data: bytes, max_pixels: int):
+    """Bild mit bewusst gesetztem Pixel-Limit oeffnen (Decompression-Bomb-Schutz):
+    ueber dem Limit wird abgebrochen, nicht nur gewarnt."""
+    import warnings
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = max_pixels
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.size  # Header lesen
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise ExtractionLimit("pixels", f"Bild hat mehr als {max_pixels} Pixel")
+    if img.format not in IMAGE_FORMATS:
+        raise ValueError(f"Bildformat nicht unterstuetzt: {img.format}")
+    if img.width * img.height > max_pixels:
+        raise ExtractionLimit("pixels", f"Bild hat {img.width * img.height} Pixel, erlaubt sind maximal {max_pixels}")
+    return img
+
+
+def extract_image_info(data: bytes, max_pages: int, max_pixels: int) -> dict:
+    """Bilder haben keine Textebene: nur Seiten (TIFF-Frames) zaehlen, Text kommt per OCR."""
+    img = _open_image(data, max_pixels)
+    n = int(getattr(img, "n_frames", 1) or 1)
+    if n > max_pages:
+        raise ExtractionLimit("pages", f"Bild hat {n} Seiten, erlaubt sind maximal {max_pages}")
+    text, sections = compose_pages([""] * n)
+    return {
+        "text": text,
+        "page_texts": [""] * n,
+        "page_methods": ["none"] * n,
+        "pages": n,
+        "extraction_method": "none",
+        "sections": sections,
+        "image_format": img.format,
+    }
+
+
+def extract(data: bytes, kind: str, max_pages: int = 200, max_pixels: int = 89_478_485) -> dict:
     if kind == "pdf":
         result = extract_pdf(data, max_pages)
+    elif kind == "image":
+        result = extract_image_info(data, max_pages, max_pixels)
     elif kind == "xlsx":
         result = extract_xlsx(data)
     elif kind == "docx":
@@ -802,10 +870,7 @@ def extract(data: bytes, kind: str, max_pages: int = 200) -> dict:
 # Worker-Einstieg (eigener Prozess): Bytes auf stdin, JSON auf stdout
 # ---------------------------------------------------------------------------
 
-def _worker_main(argv: list[str]) -> int:
-    kind = argv[1]
-    max_pages = int(argv[2])
-    max_mem_mb = int(argv[3]) if len(argv) > 3 else 0
+def _set_memory_limit(max_mem_mb: int) -> None:
     if max_mem_mb > 0:
         try:
             import resource
@@ -813,9 +878,18 @@ def _worker_main(argv: list[str]) -> int:
             resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
         except Exception:
             pass
+
+
+def _worker_main(argv: list[str]) -> int:
+    if argv[1] == "ocr":
+        return _ocr_main(argv[2:])
+    kind = argv[1]
+    max_pages = int(argv[2])
+    _set_memory_limit(int(argv[3]) if len(argv) > 3 else 0)
+    max_pixels = int(argv[4]) if len(argv) > 4 else 89_478_485
     data = sys.stdin.buffer.read()
     try:
-        out = {"ok": True, **extract(data, kind, max_pages)}
+        out = {"ok": True, **extract(data, kind, max_pages, max_pixels)}
     except ExtractionLimit as e:
         out = {"ok": False, "error": str(e), "limit_exceeded": e.limit}
     except MemoryError:
@@ -824,6 +898,101 @@ def _worker_main(argv: list[str]) -> int:
         out = {"ok": False, "error": f"Extraktion fehlgeschlagen: {type(e).__name__}: {e}"}
     sys.stdout.write(json.dumps(out, ensure_ascii=False))
     sys.stdout.flush()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# OCR-Worker (eigener Prozess): Seiten rastern (pypdfium2) und per Tesseract lesen
+# ---------------------------------------------------------------------------
+# Ausgabe: eine JSON-Zeile pro fertiger Seite, damit der Hauptprozess bei
+# aufgebrauchtem Zeitbudget mit den bis dahin fertigen Seiten weitermachen kann
+# (der Worker wird dann hart beendet). Alle Argumente kommen aus der Konfiguration,
+# nie aus Benutzereingaben; Tesseract wird ohne Shell aufgerufen.
+
+_LANGS_RE = re.compile(r"^[A-Za-z_]+(\+[A-Za-z_]+)*$")
+_TESSERACT_CONFIG = "--psm 3 -c preserve_interword_spaces=1"
+
+
+def _clean_ocr_text(text: str) -> str:
+    lines = [ln.rstrip() for ln in text.replace("\x0c", "").splitlines()]
+    out: list[str] = []
+    for ln in lines:
+        if not ln and out and not out[-1]:
+            continue
+        out.append(ln)
+    return "\n".join(out).strip("\n")
+
+
+def _emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _ocr_main(args: list[str]) -> int:
+    import os
+    import tempfile
+    import time
+
+    kind, dpi, langs, max_pixels, max_mem_mb, tmpdir, pages_csv = args[:7]
+    dpi, max_pixels = int(dpi), int(max_pixels)
+    pages = [int(p) for p in pages_csv.split(",") if p]
+    if not _LANGS_RE.match(langs):
+        _emit({"fatal": "Ungueltige OCR-Sprachangabe"})
+        return 0
+    # Temporaere Dateien (pytesseract legt Bild- und Ausgabedateien an) nur im
+    # eigenen Verzeichnis, das der Hauptprozess anlegt und im finally wieder loescht
+    tempfile.tempdir = tmpdir
+    os.environ["TMPDIR"] = tmpdir
+    _set_memory_limit(int(max_mem_mb))
+
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+    except Exception as e:
+        _emit({"fatal": f"Tesseract nicht verfuegbar ({type(e).__name__})"})
+        return 0
+
+    data = sys.stdin.buffer.read()
+
+    def ocr(img) -> str:
+        return _clean_ocr_text(pytesseract.image_to_string(img, lang=langs, config=_TESSERACT_CONFIG))
+
+    try:
+        if kind == "pdf":
+            import pypdfium2 as pdfium
+            doc = pdfium.PdfDocument(data)
+            for p in pages:
+                t0 = time.monotonic()
+                try:
+                    page = doc[p - 1]
+                    w, h = page.get_size()
+                    scale = dpi / 72.0
+                    if w * h * scale * scale > max_pixels:
+                        scale = math.sqrt(max_pixels / max(w * h, 1.0))
+                    img = page.render(scale=scale, grayscale=True).to_pil()
+                    text = ocr(img)
+                    _emit({"page": p, "text": text, "seconds": round(time.monotonic() - t0, 2)})
+                except Exception as e:
+                    _emit({"page": p, "error": f"{type(e).__name__}: {e}", "seconds": round(time.monotonic() - t0, 2)})
+        else:
+            from PIL import ImageOps
+            img = _open_image(data, max_pixels)
+            for p in pages:
+                t0 = time.monotonic()
+                try:
+                    img.seek(p - 1)
+                    frame = ImageOps.exif_transpose(img) if p == 1 else img
+                    text = ocr(frame.convert("L"))
+                    _emit({"page": p, "text": text, "seconds": round(time.monotonic() - t0, 2)})
+                except Exception as e:
+                    _emit({"page": p, "error": f"{type(e).__name__}: {e}", "seconds": round(time.monotonic() - t0, 2)})
+    except ExtractionLimit as e:
+        _emit({"fatal": str(e), "limit_exceeded": e.limit})
+    except MemoryError:
+        _emit({"fatal": "Speicherlimit bei der OCR ueberschritten", "limit_exceeded": "memory"})
+    except Exception as e:
+        _emit({"fatal": f"OCR fehlgeschlagen: {type(e).__name__}: {e}"})
+    _emit({"done": True})
     return 0
 
 

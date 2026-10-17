@@ -18,8 +18,22 @@ services:
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
+      # OCR (optional, Standardwerte siehe README)
+      - OCR_TIMEOUT_SECONDS=${OCR_TIMEOUT_SECONDS:-50}
+      - OCR_MAX_PAGES=${OCR_MAX_PAGES:-60}
+      - OCR_DPI=${OCR_DPI:-300}
+      - OCR_LANGS=${OCR_LANGS:-deu+fra+eng+ita}
+      # Disk-Cache fuer OCR-Ergebnisse, leer = aus. Fuer einen Cache ueber Redeploys
+      # hinweg zusaetzlich das Volume unten aktivieren und OCR_CACHE_DIR=/cache/ocr setzen.
+      - OCR_CACHE_DIR=${OCR_CACHE_DIR:-}
+      - OCR_CACHE_TTL_HOURS=${OCR_CACHE_TTL_HOURS:-24}
+    # volumes:
+    #   - zammad-mcp-ocr-cache:/cache/ocr
     ports:
       # Standardmässig nur auf localhost binden - öffentlicher Zugriff läuft
       # über einen Reverse-Proxy (Plesk/nginx) mit TLS. Bind-Adresse und Port
       # sind über Env-Variablen überschreibbar (z.B. für Portainer).
       - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8420}:8000"
+
+# volumes:
+#   zammad-mcp-ocr-cache:
