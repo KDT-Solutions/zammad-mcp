@@ -3,7 +3,7 @@ name = "zammad-mcp"
 # Nur Major.Minor wird von Hand gepflegt, der Patch-Teil wird automatisch
 # aus der Git-Historie gezaehlt (siehe _read_version im Paket).
 version = "1.26.0"
-description = "Zammad MCP Server für Claude (stdio lokal + HTTP/Docker cloud)"
+description = "Zammad MCP Server für Claude (HTTP/Docker, Cloud)"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0,<2.0.0",
@@ -20,9 +20,6 @@ dependencies = [
     "pytesseract>=0.3.10",
     "Pillow>=10.1.0",
 ]
-
-[project.scripts]
-zammad-mcp = "zammad_mcp:main"
 
 [build-system]
 requires = ["hatchling"]

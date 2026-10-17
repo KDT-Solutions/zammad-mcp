@@ -1,37 +1,8 @@
 # Zammad MCP Server
 
-MCP-Server zur Anbindung eines selbst gehosteten Zammad-Systems an Claude über die Zammad REST API. Läuft in zwei Betriebsarten:
-
-- **stdio (lokal)** — klassischer lokaler MCP-Server via uvx/Claude Desktop.
-- **HTTP (Cloud)** — als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer), für den Zugriff aus Cloud-Sessions ohne laufenden lokalen Rechner.
+MCP-Server zur Anbindung eines selbst gehosteten Zammad-Systems an Claude über die Zammad REST API. Läuft ausschliesslich als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer) hinter einem Reverse-Proxy. Ein lokaler Betrieb (stdio/uvx) ist nicht vorgesehen.
 
 Alle Zugangsdaten und Einstellungen (inkl. der URL der eigenen Zammad-Instanz) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code oder Repo stehen keine Secrets oder Instanz-spezifischen Angaben. Das Repo ist damit öffentlich auf GitHub hostbar und für jede beliebige selbst gehostete Zammad-Instanz nutzbar.
-
-## Lokale Installation (stdio)
-
-```bash
-cd zammad-mcp
-pip install -r requirements.txt
-```
-
-### Konfiguration in Claude Desktop (claude_desktop_config.json)
-
-```json
-{
-  "mcpServers": {
-    "zammad": {
-      "command": "uvx",
-      "args": ["--from", "C:/Pfad/zu/zammad-mcp", "--python", "3.12", "zammad-mcp"],
-      "env": {
-        "ZAMMAD_URL": "https://deine-zammad-instanz.example.com",
-        "ZAMMAD_TOKEN": "dein-api-token"
-      }
-    }
-  }
-}
-```
-
-Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich der Server exakt wie bisher - die Cloud/HTTP-Erweiterung ändert am lokalen Betrieb nichts.
 
 ## Umgebungsvariablen
 
@@ -39,8 +10,7 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 |---|---|---|---|
 | `ZAMMAD_URL` | ja | – (muss gesetzt werden) | Basis-URL der Zammad-Instanz |
 | `ZAMMAD_TOKEN` | ja | – | Zammad API-Token (Bearer für die Zammad-REST-API) |
-| `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
-| `MCP_AUTH_TOKEN` | ja, nur im HTTP-Modus | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der HTTP-Modus nicht (fail-safe) |
+| `MCP_AUTH_TOKEN` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der Server nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
 | `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
