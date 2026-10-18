@@ -81,6 +81,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 
 - Der HTTP-Modus startet nur, wenn `MCP_AUTH_TOKEN` gesetzt ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
 - Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_AUTH_TOKEN>` mitschicken, sonst Antwort `401 unauthorized`.
+- Einzige Ausnahme ist `GET /healthz` für den Docker-Healthcheck: ohne Token, liefert nur `{"status": "ok"}` (keine Version, keine Konfiguration, keine Abfrage der Zammad-API). Das Image bringt den `HEALTHCHECK` mit (interval 30s, timeout 5s, start_period 15s, retries 3).
 - `.env` ist in `.gitignore` und wird nie committet - Secrets landen nur als Umgebungsvariablen (lokal in `.env`, in der Cloud in der Portainer-Stack-Konfiguration).
 
 ## Verfügbare Tools

@@ -1949,18 +1949,29 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-async def run_http_server():
-    """Streamable-HTTP-Transport für den Cloud-/Docker-Betrieb,
-    handverdrahtet identisch zu bexio-mcp (siehe Modul-Docstring)."""
+def with_healthz(app):
+    """GET /healthz fuer den Docker-Healthcheck, ohne Auth. Liefert nur {"status": "ok"} -
+    keine Version, keine Konfiguration. Prueft nur, ob der Prozess antwortet, nicht die
+    Zammad-API (sonst wuerde ein Ausfall bei Zammad den Container unhealthy machen).
+    Alle anderen Pfade laufen unveraendert durch die Bearer-Pruefung."""
+    from starlette.responses import JSONResponse
+
+    async def router(scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/healthz" and scope["method"] in ("GET", "HEAD"):
+            await JSONResponse({"status": "ok"})(scope, receive, send)
+            return
+        await app(scope, receive, send)
+
+    return router
+
+
+def build_http_app(token: str):
+    """Starlette-App mit /mcp hinter der Bearer-Pruefung, /healthz davor, CORS aussen."""
     from starlette.applications import Starlette
     from starlette.routing import Route
     from starlette.middleware.cors import CORSMiddleware
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp.server.transport_security import TransportSecuritySettings
-    import uvicorn
-
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
 
     # security_settings explizit gesetzt statt der SDK-eigenen Auto-Erkennung
     # zu ueberlassen - siehe bexio-mcp fuer die ausfuehrliche Begruendung
@@ -1978,19 +1989,29 @@ async def run_http_server():
         routes=[Route("/mcp", endpoint=mcp_asgi_app)],
         lifespan=lambda app: session_manager.run(),
     )
-    secured_app = BearerAuthMiddleware(app, MCP_AUTH_TOKEN)
+    secured_app = with_healthz(BearerAuthMiddleware(app, token))
     # CORS aussen um die Auth-Middleware: Browser-basierte MCP-Clients (z.B.
     # Claude.ai) rufen den Endpoint per Cross-Origin-JS-Fetch auf. Ohne CORS-
     # Header blockt der Browser die Antwort, bevor der Client sie ueberhaupt
     # sieht. Preflight-OPTIONS-Requests (ohne Authorization-Header) werden von
     # CORSMiddleware direkt beantwortet, bevor sie die Bearer-Pruefung erreichen.
-    cors_app = CORSMiddleware(
+    return CORSMiddleware(
         secured_app,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["mcp-session-id"],
     )
+
+
+async def run_http_server():
+    """Streamable-HTTP-Transport für den Cloud-/Docker-Betrieb,
+    handverdrahtet identisch zu bexio-mcp (siehe Modul-Docstring)."""
+    import uvicorn
+
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+    cors_app = build_http_app(MCP_AUTH_TOKEN)
 
     config = uvicorn.Config(cors_app, host=host, port=port, log_level="info")
     srv = uvicorn.Server(config)
