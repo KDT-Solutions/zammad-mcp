@@ -20,6 +20,7 @@ services:
       - SMTP2GO_API_KEY=${SMTP2GO_API_KEY:-}
       - SMTP2GO_SMS_SENDER=${SMTP2GO_SMS_SENDER:-}
       - SMTP2GO_API_URL=${SMTP2GO_API_URL:-}
+      - SMS_MAX_UNITS=${SMS_MAX_UNITS:-3}
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
       # OCR (optional, Standardwerte siehe README)

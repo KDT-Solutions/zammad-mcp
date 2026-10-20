@@ -31,6 +31,7 @@ Alle Zugangsdaten und Einstellungen (inkl. der URL der eigenen Zammad-Instanz) w
 | `OCR_MAX_MEMORY_MB` | nein | `2048` | Speicherlimit des OCR-Prozesses (nur Linux/macOS) |
 | `SMTP2GO_API_KEY` | für SMS | leer | API-Key von SMTP2GO für `send_sms` / `list_received_sms` (ohne Key liefern beide einen Fehler, der Rest läuft normal) |
 | `SMTP2GO_SMS_SENDER` | nein | leer | Standard-Absendernummer im E.164-Format (z.B. `+447700900123`); leer = Standardabsender des SMTP2GO-Kontos |
+| `SMS_MAX_UNITS` | nein | `3` | Maximale SMS-Teile pro Nachricht (1-10). Muss zum "Message size limit" in den SMTP2GO-SMS-Einstellungen passen, sonst schneidet SMTP2GO bei aktiver "Message truncation" längere Texte still ab |
 | `SMTP2GO_API_URL` | nein | `https://api.smtp2go.com/v3` | Basis-URL der SMTP2GO-API (z.B. regionale Variante) |
 
 `MCP_HOST`/`MCP_PORT` steuern den Server im Container, `MCP_BIND_ADDR`/`MCP_HOST_PORT` das Port-Mapping nach aussen (docker-compose `ports:`) - getrennt, damit man den Container z.B. nur auf localhost binden und den öffentlichen Zugriff über einen Reverse-Proxy führen kann.
@@ -122,7 +123,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 
 `send_sms` schickt die SMS direkt über die SMTP2GO-API (`POST /sms/send`), nicht über einen Zammad-SMS-Kanal.
 
-- **Bestätigung:** Ohne `confirm=true` wird nichts gesendet. Die Vorschau zeigt Empfänger, Absender, Kodierung (GSM-7 oder UCS-2) und die Anzahl SMS-Teile. SMTP2GO erlaubt höchstens 10 Teile pro Nachricht, längere Texte werden abgelehnt.
+- **Bestätigung:** Ohne `confirm=true` wird nichts gesendet. Die Vorschau zeigt Empfänger, Absender, Kodierung (GSM-7 oder UCS-2) und die Anzahl SMS-Teile. Längere Texte als `SMS_MAX_UNITS` Teile (Standard 3, höchstens 10) werden abgelehnt. Der Wert muss zum "Message size limit" bei SMTP2GO passen.
 - **Nummern:** Schweizer Mobilnummern (`07x 123 45 67`) werden automatisch zu `+417x...` ergänzt, sonst internationales Format (`+49...` oder `0049...`). Andere nationale Nummern (z.B. Festnetz `061...`) werden abgelehnt.
 - **Empfänger aus dem Ticket:** Ohne `to` wird das Feld *Mobil* des Ticket-Kunden verwendet. Ist es leer, kommt ein Fehler.
 - **Dokumentation:** Mit `ticket_id` landet nach dem Versand eine interne Notiz (Typ `note`) mit Empfänger, Absender und Text im Ticket. Bewusst nicht als Artikeltyp `sms`, damit ein eventuell eingerichteter Zammad-SMS-Kanal die Nachricht nicht ein zweites Mal verschickt. Das Ticket muss vor dem Versand existieren, sonst wird nichts gesendet.

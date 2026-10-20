@@ -2,6 +2,7 @@
 
 ## 1.28 (Nachtrag)
 
+- `send_sms`: Maximale SMS-Teile über `SMS_MAX_UNITS` einstellbar, Standard 3 (passend zum "Message size limit" bei SMTP2GO).
 - `send_sms`: Schweizer Mobilnummern im Format `07x 123 45 67` werden automatisch zu `+417x...` ergänzt.
 
 ## 1.28

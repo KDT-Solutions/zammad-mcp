@@ -100,9 +100,11 @@ def test_missing_ticket_sends_nothing():
     assert sms.calls.call_count == 0
 
 
-def test_too_long_rejected():
+def test_too_long_rejected(monkeypatch):
+    monkeypatch.setattr(zm, "SMS_MAX_UNITS", 3)
+    assert zm.send_sms(text="a" * 459, to="+41791234567")["units"] == 3
     with pytest.raises(ValueError, match="zu lang"):
-        zm.send_sms(text="a" * 1531, to="+41791234567", confirm=True)
+        zm.send_sms(text="a" * 460, to="+41791234567", confirm=True)
 
 
 def test_missing_api_key(monkeypatch):

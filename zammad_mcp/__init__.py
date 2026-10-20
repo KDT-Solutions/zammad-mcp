@@ -896,7 +896,13 @@ SMTP2GO_API_URL = os.environ.get("SMTP2GO_API_URL", "").strip().rstrip("/") or "
 SMTP2GO_API_KEY = os.environ.get("SMTP2GO_API_KEY", "").strip()
 SMTP2GO_SMS_SENDER = os.environ.get("SMTP2GO_SMS_SENDER", "").strip()
 
-SMS_MAX_UNITS = 10  # Limit von SMTP2GO: max. 10 Teile pro Nachricht
+# Muss zum "Message size limit" in den SMTP2GO-SMS-Einstellungen passen: ist dort
+# "Message truncation" aktiv, wuerde ein laengerer Text sonst still abgeschnitten.
+# SMTP2GO selbst erlaubt hoechstens 10 Teile.
+try:
+    SMS_MAX_UNITS = max(1, min(int(os.environ.get("SMS_MAX_UNITS", "").strip() or 3), 10))
+except ValueError:
+    SMS_MAX_UNITS = 3
 
 # GSM 03.38: Basiszeichensatz (1 Zeichen) und Erweiterung (2 Zeichen, Escape)
 _GSM_BASIC = set(
@@ -989,7 +995,7 @@ def send_sms(text: str, to: str = "", ticket_id: int = None, sender: str = "", c
     if stats["units"] > SMS_MAX_UNITS:
         raise ValueError(
             f"Text zu lang: {stats['units']} SMS-Teile ({stats['encoding']}, {stats['length']} Zeichen), "
-            f"SMTP2GO erlaubt hoechstens {SMS_MAX_UNITS}"
+            f"erlaubt sind hoechstens {SMS_MAX_UNITS} (SMS_MAX_UNITS / Message size limit bei SMTP2GO)"
         )
     if ticket_id:
         api_get(f"/tickets/{ticket_id}")  # Ticket muss existieren, bevor etwas gesendet wird
@@ -2047,7 +2053,7 @@ async def list_tools():
                 "oder international (+49..., 0049...); "
                 "fehlt 'to', wird die Mobilnummer des Kunden von ticket_id verwendet. Mit ticket_id wird der Versand "
                 "als interne Notiz im Ticket dokumentiert. Antworten kommen ueber SMTP2GO 'Forward replies' als "
-                "E-Mail in Zammad an, nicht ueber dieses Tool. Max. 10 SMS-Teile (GSM-7: 160/153 Zeichen, "
+                "E-Mail in Zammad an, nicht ueber dieses Tool. Max. 3 SMS-Teile (einstellbar ueber SMS_MAX_UNITS; GSM-7: 160/153 Zeichen, "
                 "mit Zeichen ausserhalb GSM-7, z.B. Emojis, UCS-2: 70/67)."
             ),
             inputSchema={"type": "object", "properties": {
