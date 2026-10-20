@@ -30,12 +30,14 @@ def env(monkeypatch):
     ("+41 79 123 45 67", "+41791234567"),
     ("0041-79-123.45.67", "+41791234567"),
     ("+49 (151) 1234567", "+491511234567"),
+    ("079 123 45 67", "+41791234567"),
+    ("076-123.45.67", "+41761234567"),
 ])
 def test_normalize_phone_ok(raw, expected):
     assert zm._normalize_phone(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["079 123 45 67", "", "+41abc", "+123", "+0791234567", "+1234567890123456"])
+@pytest.mark.parametrize("raw", ["061 123 45 67", "079 123 45 6", "0791234567 8", "", "+41abc", "+123", "+0791234567", "+1234567890123456"])
 def test_normalize_phone_rejects(raw):
     with pytest.raises(ValueError):
         zm._normalize_phone(raw)

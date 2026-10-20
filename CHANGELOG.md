@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.28 (Nachtrag)
+
+- `send_sms`: Schweizer Mobilnummern im Format `07x 123 45 67` werden automatisch zu `+417x...` ergänzt.
+
 ## 1.28
 
 - Neues Tool `send_sms`: SMS über das SMS-Gateway von SMTP2GO senden. Ohne `confirm=true` nur Vorschau (Empfänger, Absender, Kodierung, SMS-Teile). Empfänger im internationalen Format oder Mobilnummer des Ticket-Kunden; mit `ticket_id` wird der Versand als interne Notiz dokumentiert. Max. 10 SMS-Teile.

@@ -907,17 +907,20 @@ _GSM_EXT = set("^{}\\[~]|€\f")
 
 
 def _normalize_phone(number: str) -> str:
-    """Nummer ins E.164-Format (+<Ziffern>) bringen. Erwartet internationales Format
-    (+41... oder 0041...); lokale Nummern (079...) werden abgelehnt statt eine Landesvorwahl zu raten."""
+    """Nummer ins E.164-Format (+<Ziffern>) bringen. Internationales Format (+41... oder 0041...)
+    oder Schweizer Mobilnummer 07x 123 45 67 (wird zu +417x...). Andere nationale Nummern werden abgelehnt."""
     raw = (number or "").strip()
     if not raw:
         raise ValueError("Telefonnummer fehlt")
     cleaned = re.sub(r"[\s\-./()]", "", raw)
     if cleaned.startswith("00"):
         cleaned = "+" + cleaned[2:]
+    elif re.fullmatch(r"07\d{8}", cleaned):
+        cleaned = "+41" + cleaned[1:]  # Schweizer Mobilnummer
     if not cleaned.startswith("+"):
         raise ValueError(
-            f"Telefonnummer '{number}' nicht im internationalen Format. Erwartet z.B. +41791234567 oder 0041791234567"
+            f"Telefonnummer '{number}' nicht erkannt. Erwartet Schweizer Mobilnummer (079 123 45 67) "
+            f"oder internationales Format (+41791234567, 0041791234567)"
         )
     digits = cleaned[1:]
     if not digits.isdigit() or not 8 <= len(digits) <= 15 or digits.startswith("0"):
@@ -2040,7 +2043,8 @@ async def list_tools():
             description=(
                 "SMS ueber das SMS-Gateway von SMTP2GO senden (nicht ueber Zammad). Ohne confirm=true wird NICHTS "
                 "gesendet, es kommt nur eine Vorschau (Empfaenger, Absender, Kodierung, Anzahl SMS-Teile). "
-                "Nur auf ausdruecklichen Auftrag senden. Empfaenger im internationalen Format (+41... oder 0041...); "
+                "Nur auf ausdruecklichen Auftrag senden. Empfaenger als Schweizer Mobilnummer (079 123 45 67, wird zu +4179...) "
+                "oder international (+49..., 0049...); "
                 "fehlt 'to', wird die Mobilnummer des Kunden von ticket_id verwendet. Mit ticket_id wird der Versand "
                 "als interne Notiz im Ticket dokumentiert. Antworten kommen ueber SMTP2GO 'Forward replies' als "
                 "E-Mail in Zammad an, nicht ueber dieses Tool. Max. 10 SMS-Teile (GSM-7: 160/153 Zeichen, "
@@ -2048,7 +2052,7 @@ async def list_tools():
             ),
             inputSchema={"type": "object", "properties": {
                 "text": {"type": "string", "description": "SMS-Text (Klartext)"},
-                "to": {"type": "string", "description": "Empfaengernummer, z.B. +41791234567. Leer = Mobilnummer des Ticket-Kunden"},
+                "to": {"type": "string", "description": "Empfaengernummer, z.B. 079 123 45 67 oder +41791234567. Leer = Mobilnummer des Ticket-Kunden"},
                 "ticket_id": {"type": "integer", "description": "Interne Ticket-ID; Versand wird dort als interne Notiz dokumentiert"},
                 "sender": {"type": "string", "description": "Optionale Absendernummer (E.164); Standard aus SMTP2GO_SMS_SENDER bzw. SMTP2GO-Konto"},
                 "confirm": {"type": "boolean", "default": False, "description": "true = wirklich senden, sonst nur Vorschau"},

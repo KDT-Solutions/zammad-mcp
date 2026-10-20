@@ -123,7 +123,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 `send_sms` schickt die SMS direkt über die SMTP2GO-API (`POST /sms/send`), nicht über einen Zammad-SMS-Kanal.
 
 - **Bestätigung:** Ohne `confirm=true` wird nichts gesendet. Die Vorschau zeigt Empfänger, Absender, Kodierung (GSM-7 oder UCS-2) und die Anzahl SMS-Teile. SMTP2GO erlaubt höchstens 10 Teile pro Nachricht, längere Texte werden abgelehnt.
-- **Nummern:** nur internationales Format (`+41...` oder `0041...`). Nationale Nummern wie `079...` werden abgelehnt, statt eine Landesvorwahl zu raten.
+- **Nummern:** Schweizer Mobilnummern (`07x 123 45 67`) werden automatisch zu `+417x...` ergänzt, sonst internationales Format (`+49...` oder `0049...`). Andere nationale Nummern (z.B. Festnetz `061...`) werden abgelehnt.
 - **Empfänger aus dem Ticket:** Ohne `to` wird das Feld *Mobil* des Ticket-Kunden verwendet. Ist es leer, kommt ein Fehler.
 - **Dokumentation:** Mit `ticket_id` landet nach dem Versand eine interne Notiz (Typ `note`) mit Empfänger, Absender und Text im Ticket. Bewusst nicht als Artikeltyp `sms`, damit ein eventuell eingerichteter Zammad-SMS-Kanal die Nachricht nicht ein zweites Mal verschickt. Das Ticket muss vor dem Versand existieren, sonst wird nichts gesendet.
 - **Antworten:** kommen nicht über diesen Server zurück. In SMTP2GO unter *SMS Settings → Forward replies* eine E-Mail-Adresse eintragen, die als Kanal in Zammad eingebunden ist; die Adresse muss bei SMTP2GO ein verifizierter Absender sein (Domain oder Single Sender). Zusätzlich lassen sich eingegangene SMS mit `list_received_sms` abfragen.
