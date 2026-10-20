@@ -29,6 +29,9 @@ Alle Zugangsdaten und Einstellungen (inkl. der URL der eigenen Zammad-Instanz) w
 | `OCR_MAX_IMAGE_PIXELS` | nein | `100000000` | Pixel-Limit pro Bild/Seite gegen Decompression-Bombs; PDF-Seiten werden darunter gerastert |
 | `OCR_MAX_PARALLEL` | nein | `2` | Gleichzeitige OCR-Prozesse |
 | `OCR_MAX_MEMORY_MB` | nein | `2048` | Speicherlimit des OCR-Prozesses (nur Linux/macOS) |
+| `SMTP2GO_API_KEY` | für SMS | leer | API-Key von SMTP2GO für `send_sms` / `list_received_sms` (ohne Key liefern beide einen Fehler, der Rest läuft normal) |
+| `SMTP2GO_SMS_SENDER` | nein | leer | Standard-Absendernummer im E.164-Format (z.B. `+447700900123`); leer = Standardabsender des SMTP2GO-Kontos |
+| `SMTP2GO_API_URL` | nein | `https://api.smtp2go.com/v3` | Basis-URL der SMTP2GO-API (z.B. regionale Variante) |
 
 `MCP_HOST`/`MCP_PORT` steuern den Server im Container, `MCP_BIND_ADDR`/`MCP_HOST_PORT` das Port-Mapping nach aussen (docker-compose `ports:`) - getrennt, damit man den Container z.B. nur auf localhost binden und den öffentlichen Zugriff über einen Reverse-Proxy führen kann.
 
@@ -63,6 +66,7 @@ docker compose up -d
    - `ZAMMAD_URL`
    - `ZAMMAD_TOKEN`
    - `MCP_AUTH_TOKEN`
+   - für SMS: `SMTP2GO_API_KEY`, optional `SMTP2GO_SMS_SENDER`
    - optional `MCP_BIND_ADDR` / `MCP_HOST_PORT`, falls die Standardwerte nicht passen
 4. **Deploy the stack**
 5. Für ein Update später: im Stack auf **Pull and redeploy** klicken - das zieht jetzt zuverlässig das aktuelle Image aus der Registry (kein lokaler Build mehr nötig, siehe oben)
@@ -110,7 +114,20 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 | `merge_ticket` | Zwei Tickets zusammenführen |
 | `delete_ticket_article` | Ticket-Artikel löschen |
 | `set_article_internal` | Bestehenden Ticket-Artikel auf intern (oder öffentlich) stellen |
+| `send_sms` | SMS über das SMS-Gateway von SMTP2GO senden. Ohne `confirm=true` nur Vorschau. Ohne `to` wird die Mobilnummer des Ticket-Kunden verwendet; mit `ticket_id` wird der Versand als interne Notiz im Ticket dokumentiert |
+| `list_received_sms` | Bei SMTP2GO eingegangene SMS (Antworten) abfragen, read-only |
 | `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten; mit `attachment_urls` werden PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt (nur oeffentliche http/https-Adressen, max. 20 MB, via `URL_ATTACHMENT_MAX_BYTES` anpassbar) |
+
+## SMS (SMTP2GO)
+
+`send_sms` schickt die SMS direkt über die SMTP2GO-API (`POST /sms/send`), nicht über einen Zammad-SMS-Kanal.
+
+- **Bestätigung:** Ohne `confirm=true` wird nichts gesendet. Die Vorschau zeigt Empfänger, Absender, Kodierung (GSM-7 oder UCS-2) und die Anzahl SMS-Teile. SMTP2GO erlaubt höchstens 10 Teile pro Nachricht, längere Texte werden abgelehnt.
+- **Nummern:** nur internationales Format (`+41...` oder `0041...`). Nationale Nummern wie `079...` werden abgelehnt, statt eine Landesvorwahl zu raten.
+- **Empfänger aus dem Ticket:** Ohne `to` wird das Feld *Mobil* des Ticket-Kunden verwendet. Ist es leer, kommt ein Fehler.
+- **Dokumentation:** Mit `ticket_id` landet nach dem Versand eine interne Notiz (Typ `note`) mit Empfänger, Absender und Text im Ticket. Bewusst nicht als Artikeltyp `sms`, damit ein eventuell eingerichteter Zammad-SMS-Kanal die Nachricht nicht ein zweites Mal verschickt. Das Ticket muss vor dem Versand existieren, sonst wird nichts gesendet.
+- **Antworten:** kommen nicht über diesen Server zurück. In SMTP2GO unter *SMS Settings → Forward replies* eine E-Mail-Adresse eintragen, die als Kanal in Zammad eingebunden ist; die Adresse muss bei SMTP2GO ein verifizierter Absender sein (Domain oder Single Sender). Zusätzlich lassen sich eingegangene SMS mit `list_received_sms` abfragen.
+- **Absender:** Antworten sind nur möglich, wenn die SMS von einer Nummer kommt, die Antworten empfangen kann. Mit einer alphanumerischen Sender-ID gehen laut SMTP2GO keine Antworten ein.
 
 ## Textextraktion aus Anhängen
 

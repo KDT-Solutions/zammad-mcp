@@ -883,6 +883,153 @@ def forward_ticket(
 
 
 # ---------------------------------------------------------------------------
+# SMS ueber das SMS-Gateway von SMTP2GO
+# ---------------------------------------------------------------------------
+# Versand per SMTP2GO-API (POST /sms/send), nicht ueber einen Zammad-SMS-Kanal.
+# Antworten der Empfaenger kommen nicht ueber diesen Server zurueck, sondern ueber
+# die SMTP2GO-Einstellung "Forward replies" als E-Mail in ein Zammad-Postfach.
+# Der Versand ist im Ticket als interne Notiz dokumentiert (Typ "note", damit ein
+# eventuell konfigurierter Zammad-SMS-Kanal die Nachricht nicht ein zweites Mal sendet).
+# Ohne confirm=true wird nichts gesendet, es kommt nur eine Vorschau zurueck.
+
+SMTP2GO_API_URL = os.environ.get("SMTP2GO_API_URL", "").strip().rstrip("/") or "https://api.smtp2go.com/v3"
+SMTP2GO_API_KEY = os.environ.get("SMTP2GO_API_KEY", "").strip()
+SMTP2GO_SMS_SENDER = os.environ.get("SMTP2GO_SMS_SENDER", "").strip()
+
+SMS_MAX_UNITS = 10  # Limit von SMTP2GO: max. 10 Teile pro Nachricht
+
+# GSM 03.38: Basiszeichensatz (1 Zeichen) und Erweiterung (2 Zeichen, Escape)
+_GSM_BASIC = set(
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+_GSM_EXT = set("^{}\\[~]|€\f")
+
+
+def _normalize_phone(number: str) -> str:
+    """Nummer ins E.164-Format (+<Ziffern>) bringen. Erwartet internationales Format
+    (+41... oder 0041...); lokale Nummern (079...) werden abgelehnt statt eine Landesvorwahl zu raten."""
+    raw = (number or "").strip()
+    if not raw:
+        raise ValueError("Telefonnummer fehlt")
+    cleaned = re.sub(r"[\s\-./()]", "", raw)
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if not cleaned.startswith("+"):
+        raise ValueError(
+            f"Telefonnummer '{number}' nicht im internationalen Format. Erwartet z.B. +41791234567 oder 0041791234567"
+        )
+    digits = cleaned[1:]
+    if not digits.isdigit() or not 8 <= len(digits) <= 15 or digits.startswith("0"):
+        raise ValueError(f"Ungueltige Telefonnummer: '{number}'")
+    return "+" + digits
+
+
+def _sms_units(text: str) -> dict:
+    """Kodierung und Anzahl SMS-Teile schaetzen (GSM-7: 160/153, sonst UCS-2: 70/67).
+    SMTP2GO kann mit 'Smart encoding' Sonderzeichen ersetzen - dann wird es eher weniger."""
+    if all(c in _GSM_BASIC or c in _GSM_EXT for c in text):
+        length = sum(2 if c in _GSM_EXT else 1 for c in text)
+        single, multi, encoding = 160, 153, "GSM-7"
+    else:
+        length = len(text.encode("utf-16-le")) // 2
+        single, multi, encoding = 70, 67, "UCS-2"
+    units = 1 if length <= single else -(-length // multi)
+    return {"encoding": encoding, "length": length, "units": units}
+
+
+def _smtp2go_post(path: str, payload: dict) -> dict:
+    if not SMTP2GO_API_KEY:
+        raise RuntimeError("SMTP2GO_API_KEY ist nicht gesetzt (Umgebungsvariable fehlt)")
+    response = httpx.post(
+        f"{SMTP2GO_API_URL}{path}",
+        headers={"X-Smtp2go-Api-Key": SMTP2GO_API_KEY, "Content-Type": "application/json", "Accept": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    if not response.is_success:
+        raise RuntimeError(f"SMTP2GO API Fehler {response.status_code}: {json.dumps(data, ensure_ascii=False)}")
+    return data
+
+
+def _ticket_customer_mobile(ticket_id: int) -> str:
+    customer_id = api_get(f"/tickets/{ticket_id}").get("customer_id")
+    if not customer_id or customer_id == 1:
+        raise ValueError(f"Ticket {ticket_id} hat keinen Kunden - Empfaenger 'to' angeben")
+    mobile = (api_get(f"/users/{customer_id}").get("mobile") or "").strip()
+    if not mobile:
+        raise ValueError(
+            f"Beim Kunden von Ticket {ticket_id} ({_user_label(customer_id)}) ist keine Mobilnummer hinterlegt - 'to' angeben"
+        )
+    return mobile
+
+
+def send_sms(text: str, to: str = "", ticket_id: int = None, sender: str = "", confirm: bool = False) -> dict:
+    """SMS ueber SMTP2GO senden. Ohne confirm=true nur Vorschau. Mit ticket_id wird der Versand
+    als interne Notiz im Ticket dokumentiert; ohne 'to' wird die Mobilnummer des Ticket-Kunden verwendet."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Text fehlt")
+    if not (to or "").strip():
+        if not ticket_id:
+            raise ValueError("Empfaenger fehlt: 'to' angeben oder 'ticket_id' (Mobilnummer des Ticket-Kunden)")
+        to = _ticket_customer_mobile(ticket_id)
+    destination = _normalize_phone(to)
+    sender_number = _normalize_phone(sender) if (sender or "").strip() else (
+        _normalize_phone(SMTP2GO_SMS_SENDER) if SMTP2GO_SMS_SENDER else ""
+    )
+    stats = _sms_units(text)
+    if stats["units"] > SMS_MAX_UNITS:
+        raise ValueError(
+            f"Text zu lang: {stats['units']} SMS-Teile ({stats['encoding']}, {stats['length']} Zeichen), "
+            f"SMTP2GO erlaubt hoechstens {SMS_MAX_UNITS}"
+        )
+    if ticket_id:
+        api_get(f"/tickets/{ticket_id}")  # Ticket muss existieren, bevor etwas gesendet wird
+
+    preview = {
+        "to": destination,
+        "sender": sender_number or "SMTP2GO-Standardabsender",
+        "ticket_id": ticket_id,
+        "text": text,
+        **stats,
+    }
+    if not confirm:
+        return {"preview": True, "sent": False, "hinweis": "Nichts gesendet. Zum Senden mit confirm=true erneut aufrufen.", **preview}
+
+    payload = {"destination": [destination], "content": text}
+    if sender_number:
+        payload["sender"] = sender_number
+    api_result = _smtp2go_post("/sms/send", payload)
+
+    result = {"success": True, "sent": True, **preview, "smtp2go": api_result}
+    if ticket_id:
+        note = (
+            f"SMS gesendet an {destination} (Absender: {preview['sender']}, {stats['units']} Teil(e))\n\n{text}"
+        )
+        try:
+            result["note_article_id"] = add_ticket_note(ticket_id, note)["article_id"]
+        except Exception as e:
+            result["note_error"] = f"SMS wurde gesendet, Notiz im Ticket fehlgeschlagen: {e}"
+    return result
+
+
+def list_received_sms(start_date: str = "", end_date: str = "") -> dict:
+    """Bei SMTP2GO eingegangene SMS (Antworten) abfragen. Read-only. Datumsangaben ISO-8601 (UTC);
+    ohne Angabe liefert SMTP2GO die letzten 7 Tage."""
+    payload = {}
+    if (start_date or "").strip():
+        payload["start_date"] = start_date.strip()
+    if (end_date or "").strip():
+        payload["end_date"] = end_date.strip()
+    return _smtp2go_post("/sms/view-received", payload)
+
+
+# ---------------------------------------------------------------------------
 # Textextraktion aus Anhaengen (get_attachment_text, find_in_attachments)
 # ---------------------------------------------------------------------------
 # download_attachment liefert Base64, das bei groesseren PDFs im Client abgeschnitten
@@ -1660,6 +1807,8 @@ TOOL_FUNCS = {
     "delete_ticket_article": delete_ticket_article,
     "set_article_internal": set_article_internal,
     "forward_ticket": forward_ticket,
+    "send_sms": send_sms,
+    "list_received_sms": list_received_sms,
 }
 
 
@@ -1885,6 +2034,33 @@ async def list_tools():
                 "attachment_urls": {"type": "array", "items": {"type": "string"}, "description": "Optional: PDFs von diesen URLs (z.B. Rechnungs-Link in der Mail) serverseitig herunterladen und im Original anhaengen. Redirects werden verfolgt; nur oeffentliche http/https-Adressen. Bei Download-Fehler wird nichts gesendet."},
                 "attachment_url_filenames": {"type": "array", "items": {"type": "string"}, "description": "Optional: Dateinamen zu attachment_urls (gleiche Reihenfolge)"},
             }, "required": ["ticket_id", "article_id", "to"]},
+        ),
+        Tool(
+            name="send_sms",
+            description=(
+                "SMS ueber das SMS-Gateway von SMTP2GO senden (nicht ueber Zammad). Ohne confirm=true wird NICHTS "
+                "gesendet, es kommt nur eine Vorschau (Empfaenger, Absender, Kodierung, Anzahl SMS-Teile). "
+                "Nur auf ausdruecklichen Auftrag senden. Empfaenger im internationalen Format (+41... oder 0041...); "
+                "fehlt 'to', wird die Mobilnummer des Kunden von ticket_id verwendet. Mit ticket_id wird der Versand "
+                "als interne Notiz im Ticket dokumentiert. Antworten kommen ueber SMTP2GO 'Forward replies' als "
+                "E-Mail in Zammad an, nicht ueber dieses Tool. Max. 10 SMS-Teile (GSM-7: 160/153 Zeichen, "
+                "mit Zeichen ausserhalb GSM-7, z.B. Emojis, UCS-2: 70/67)."
+            ),
+            inputSchema={"type": "object", "properties": {
+                "text": {"type": "string", "description": "SMS-Text (Klartext)"},
+                "to": {"type": "string", "description": "Empfaengernummer, z.B. +41791234567. Leer = Mobilnummer des Ticket-Kunden"},
+                "ticket_id": {"type": "integer", "description": "Interne Ticket-ID; Versand wird dort als interne Notiz dokumentiert"},
+                "sender": {"type": "string", "description": "Optionale Absendernummer (E.164); Standard aus SMTP2GO_SMS_SENDER bzw. SMTP2GO-Konto"},
+                "confirm": {"type": "boolean", "default": False, "description": "true = wirklich senden, sonst nur Vorschau"},
+            }, "required": ["text"]},
+        ),
+        Tool(
+            name="list_received_sms",
+            description="Bei SMTP2GO eingegangene SMS (Antworten auf gesendete SMS) abfragen. Read-only. Ohne Datum: letzte 7 Tage. Datumsangaben ISO-8601 in UTC (end_date exklusiv).",
+            inputSchema={"type": "object", "properties": {
+                "start_date": {"type": "string", "description": "z.B. 2026-10-01T00:00:00Z"},
+                "end_date": {"type": "string", "description": "z.B. 2026-10-20T23:59:59Z"},
+            }},
         ),
     ]
 

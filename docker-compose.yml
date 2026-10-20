@@ -16,6 +16,10 @@ services:
       - ZAMMAD_URL=${ZAMMAD_URL}
       - ZAMMAD_TOKEN=${ZAMMAD_TOKEN}
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      # SMS ueber SMTP2GO (optional, ohne Key sind nur die SMS-Tools ohne Funktion)
+      - SMTP2GO_API_KEY=${SMTP2GO_API_KEY:-}
+      - SMTP2GO_SMS_SENDER=${SMTP2GO_SMS_SENDER:-}
+      - SMTP2GO_API_URL=${SMTP2GO_API_URL:-}
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
       # OCR (optional, Standardwerte siehe README)
