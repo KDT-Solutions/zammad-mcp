@@ -108,6 +108,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 | `list_groups` | Alle aktiven Gruppen auflisten |
 | `set_ticket_group` | Ticket in eine andere Gruppe verschieben |
 | `set_ticket_owner` | Ticket einem Agent zuweisen (E-Mail, Login oder Name; `none` entfernt die Zuweisung) |
+| `set_ticket_customer` | Kunde eines Tickets wechseln (E-Mail, Login oder Name eines bestehenden Users; Organisation wird mitgesetzt, kein automatisches Anlegen) |
 | `update_customer_name` | Vor- und/oder Nachname eines Kunden korrigieren (per E-Mail oder Ticket) |
 | `add_ticket_note` | Interne Notiz hinzufügen |
 | `update_ticket_state` | Ticket-Status ändern |
