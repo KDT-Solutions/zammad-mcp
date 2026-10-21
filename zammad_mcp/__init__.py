@@ -444,6 +444,58 @@ def set_ticket_owner(ticket_id: int, owner: str) -> dict:
     return {"success": True, "ticket_id": ticket_id, "owner": label}
 
 
+def _resolve_customer(customer: str) -> dict:
+    """E-Mail, Login oder 'Vorname Nachname' -> User-Dict. Nur aktive User, exakter Treffer,
+    kein stiller Fallback und keine automatische Neuanlage: nicht gefunden oder mehrdeutig
+    ist ein Fehler mit Liste der gefundenen User."""
+    query = (customer or "").strip()
+    if not query:
+        raise ValueError("Kunde fehlt. Erwartet: E-Mail, Login oder 'Vorname Nachname' eines bestehenden Kunden")
+    users = [u for u in api_get("/users/search", params={"query": query, "limit": 20}) if u.get("active", True)]
+    q = query.lower()
+    matches = []
+    for u in users:
+        full_name = " ".join(x for x in (u.get("firstname"), u.get("lastname")) if x).strip()
+        if q in {(u.get("email") or "").lower(), (u.get("login") or "").lower(), full_name.lower()}:
+            matches.append(u)
+    found = ", ".join(_user_label(u["id"], {"User": {str(u["id"]): u}}) for u in users) or "keine"
+    if not matches:
+        raise ValueError(f"Kunde '{customer}' nicht gefunden. Gefundene User: {found}")
+    if len(matches) > 1:
+        raise ValueError(f"Kunde '{customer}' mehrdeutig. Gefundene User: {found}")
+    return matches[0]
+
+
+def set_ticket_customer(ticket_id: int, customer: str) -> dict:
+    """Kunde eines Tickets wechseln. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden,
+    aktiven Users. Die Organisation des Tickets wird wie in der Zammad-Oberflaeche auf die Organisation
+    des neuen Kunden gesetzt (bzw. geleert, wenn er keine hat)."""
+    ticket = api_get(f"/tickets/{ticket_id}")
+    new = _resolve_customer(customer)
+    old_id = ticket.get("customer_id")
+    old_label = _user_label(old_id) if old_id and old_id != 1 else None
+    new_label = _user_label(new["id"], {"User": {str(new["id"]): new}})
+    if old_id == new["id"]:
+        return {"success": True, "ticket_id": ticket_id, "unchanged": True, "customer": new_label}
+    payload = {"customer_id": new["id"], "organization_id": new.get("organization_id")}
+    url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
+    response = httpx.put(url, headers=get_headers(), json=payload, timeout=30)
+    if not response.is_success:
+        return {"success": False, "status_code": response.status_code, "error": response.text}
+    updated = response.json()
+    result = {
+        "success": True,
+        "ticket_id": ticket_id,
+        "ticket_number": updated.get("number", ticket.get("number")),
+        "old_customer": old_label,
+        "new_customer": new_label,
+    }
+    if updated.get("customer_id") != new["id"]:
+        result["success"] = False
+        result["error"] = f"Zammad hat den Kunden nicht uebernommen (customer_id ist {updated.get('customer_id')})"
+    return result
+
+
 def update_customer_name(firstname: str = None, lastname: str = None, email: str = "", ticket_id: int = None) -> dict:
     """Vor- und/oder Nachname eines Kunden korrigieren. Kunde wird ueber exakte E-Mail oder ueber ticket_id
     (Kunde des Tickets) bestimmt, genau eines von beiden. Nicht uebergebene Namensfelder bleiben unveraendert."""
@@ -1807,6 +1859,7 @@ TOOL_FUNCS = {
     "list_groups": list_groups,
     "set_ticket_group": set_ticket_group,
     "set_ticket_owner": set_ticket_owner,
+    "set_ticket_customer": set_ticket_customer,
     "update_customer_name": update_customer_name,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
@@ -1963,6 +2016,14 @@ async def list_tools():
                 "ticket_id": {"type": "integer"},
                 "owner": {"type": "string"},
             }, "required": ["ticket_id", "owner"]},
+        ),
+        Tool(
+            name="set_ticket_customer",
+            description="Kunde eines Tickets wechseln. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden, aktiven Users; unbekannte oder mehrdeutige Angaben werden abgelehnt, es wird kein neuer Kunde angelegt. Die Organisation des Tickets wird auf die des neuen Kunden gesetzt. Bestehende Artikel bleiben unveraendert.",
+            inputSchema={"type": "object", "properties": {
+                "ticket_id": {"type": "integer"},
+                "customer": {"type": "string", "description": "E-Mail, Login oder 'Vorname Nachname' des neuen Kunden"},
+            }, "required": ["ticket_id", "customer"]},
         ),
         Tool(
             name="update_customer_name",
