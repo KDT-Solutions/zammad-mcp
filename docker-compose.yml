@@ -12,6 +12,8 @@ services:
     pull_policy: always
     container_name: zammad-mcp-cloud
     restart: unless-stopped
+    # cap_drop/security_opt sind hier bewusst nicht gesetzt: Portainer lehnt security-opt und
+    # Capabilities fuer Nicht-Admin-Benutzer ab (Stack wird vom MCP-User deployt).
     environment:
       - ZAMMAD_URL=${ZAMMAD_URL}
       - ZAMMAD_TOKEN=${ZAMMAD_TOKEN}
@@ -36,10 +38,6 @@ services:
     #   - zammad-mcp-ocr-cache:/cache/ocr
     # Haertung: Container laeuft als User "app" (siehe Dockerfile), keine Capabilities,
     # keine Rechteausweitung ueber setuid-Binaries.
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
     ports:
       # Standard: nur auf localhost des Docker-Hosts gebunden. Soll der Nginx Proxy
       # Manager den Dienst ueber <Host-IP>:8420 erreichen, MCP_BIND_ADDR auf diese
