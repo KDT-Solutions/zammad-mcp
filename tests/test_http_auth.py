@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import zammad_mcp as zm  # noqa: E402
 
-TOKEN = "test-mcp-auth-token"
+TOKEN = "test-mcp-auth-token-0123456789abcdef"  # >= 32 Zeichen (Mindestlaenge)
 HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 

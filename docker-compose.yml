@@ -34,11 +34,18 @@ services:
       - OCR_CACHE_TTL_HOURS=${OCR_CACHE_TTL_HOURS:-24}
     # volumes:
     #   - zammad-mcp-ocr-cache:/cache/ocr
+    # Haertung: Container laeuft als User "app" (siehe Dockerfile), keine Capabilities,
+    # keine Rechteausweitung ueber setuid-Binaries.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     ports:
-      # Auf allen Interfaces gebunden (Standard wie bei allen MCP-Stacks), damit
-      # NPM den Dienst ueber <Host-IP>:8420 erreicht. Die Zugriffskontrolle ist das
-      # Bearer-Token, TLS macht der Reverse-Proxy. Ueber MCP_BIND_ADDR einschraenkbar.
-      - "${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8420}:8000"
+      # Standard: nur auf localhost des Docker-Hosts gebunden. Soll der Nginx Proxy
+      # Manager den Dienst ueber <Host-IP>:8420 erreichen, MCP_BIND_ADDR auf diese
+      # IP setzen (z.B. die LAN-IP des Hosts, nicht 0.0.0.0). Die Zugriffskontrolle
+      # ist das Bearer-Token, TLS macht der Reverse-Proxy.
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8420}:8000"
 
 # volumes:
 #   zammad-mcp-ocr-cache:

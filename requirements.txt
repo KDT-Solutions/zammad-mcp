@@ -1,13 +1,17 @@
-mcp>=1.0.0,<2.0.0
-httpx>=0.27.0
-uvicorn>=0.30.0
-starlette>=0.27.0
-pdfminer.six>=20231228
-pypdf>=4.0.0
-fonttools>=4.40.0
-openpyxl>=3.1.0
-python-docx>=1.1.0
-regex>=2023.8.8
-pypdfium2>=4.20.0
-pytesseract>=0.3.10
-Pillow>=10.1.0
+# Exakt gepinnt (Stand 2026-10-24), damit ein Build reproduzierbar ist und ein
+# stilles Downgrade/Upgrade einer Abhaengigkeit nicht moeglich ist. mcp >= 1.10
+# ist noetig, weil das SDK erst ab dieser Version die Tool-Argumente gegen das
+# Schema prueft (validate_input). Updates bewusst per Commit (Tests laufen lassen).
+mcp==1.30.0
+httpx==0.28.1
+uvicorn==0.54.0
+starlette==1.9.0
+pdfminer.six==20260107
+pypdf==6.21.2
+fonttools==4.67.0
+openpyxl==3.1.5
+python-docx==1.2.0
+regex==2026.9.29
+pypdfium2==5.14.0
+pytesseract==0.3.13
+Pillow==13.0.0

@@ -10,15 +10,16 @@ Alle Zugangsdaten und Einstellungen (inkl. der URL der eigenen Zammad-Instanz) w
 |---|---|---|---|
 | `ZAMMAD_URL` | ja | – (muss gesetzt werden) | Basis-URL der Zammad-Instanz |
 | `ZAMMAD_TOKEN` | ja | – | Zammad API-Token (Bearer für die Zammad-REST-API) |
-| `MCP_AUTH_TOKEN` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der Server nicht (fail-safe) |
+| `MCP_AUTH_TOKEN` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints, mindestens 32 Zeichen (z.B. `openssl rand -base64 48`). Ohne oder mit zu kurzem Token startet der Server nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
-| `MCP_BIND_ADDR` | nein | `0.0.0.0` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
+| `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping). Für den Zugriff des Reverse-Proxys über die Host-IP auf diese IP setzen (nicht `0.0.0.0`) |
 | `MCP_HOST_PORT` | nein | `8420` | Port *auf dem Docker-Host* (docker-compose Port-Mapping) |
-| `ATTACHMENT_TEXT_MAX_BYTES` | nein | `26214400` (25 MB) | Maximale Anhangsgrösse für `get_attachment_text` / `find_in_attachments` |
+| `ATTACHMENT_TEXT_MAX_BYTES` | nein | `26214400` (25 MB) | Maximale Anhangsgrösse für `download_attachment`, `get_attachment_text`, `find_in_attachments` und die Anhänge von `forward_ticket` (Content-Length vorab, Abbruch beim Streamen) |
 | `ATTACHMENT_TEXT_MAX_PDF_PAGES` | nein | `200` | Maximale Seitenzahl pro PDF |
 | `ATTACHMENT_TEXT_TIMEOUT` | nein | `30` | Timeout pro Datei in Sekunden (Extraktion wird danach hart beendet) |
 | `ATTACHMENT_TEXT_MAX_MEMORY_MB` | nein | `1024` | Speicherlimit des Extraktionsprozesses (nur Linux/macOS) |
+| `URL_ATTACHMENT_MAX_BYTES` | nein | `20971520` (20 MB) | Maximale Dateigrösse pro URL-Download bei `forward_ticket` (`attachment_urls`) |
 | `FIND_IN_ATTACHMENTS_TIMEOUT` | nein | `240` | Gesamtzeit für `find_in_attachments`, danach werden restliche Anhänge als `not_checked` gemeldet |
 | `OCR_TIMEOUT_SECONDS` | nein | `50` | Zeitbudget pro Aufruf für OCR (inkl. Download und normaler Extraktion); danach Rückgabe mit `next_page` |
 | `OCR_MAX_PAGES` | nein | `60` | OCR nur für die Seiten 1 bis N eines Dokuments, spätere Seiten werden als `ocr_skipped_pages` gemeldet |
@@ -48,7 +49,7 @@ Das Docker-Image wird **nicht** lokal aus dem Dockerfile gebaut, sondern bei jed
 git clone <repo-url> zammad-mcp
 cd zammad-mcp
 cp .env.example .env
-# .env ausfüllen: ZAMMAD_URL, ZAMMAD_TOKEN, MCP_AUTH_TOKEN (langes zufälliges Token generieren)
+# .env ausfüllen: ZAMMAD_URL, ZAMMAD_TOKEN, MCP_AUTH_TOKEN (zufälliges Token, mind. 32 Zeichen, z.B. openssl rand -base64 48)
 docker compose up -d
 ```
 
@@ -68,7 +69,7 @@ docker compose up -d
    - `ZAMMAD_TOKEN`
    - `MCP_AUTH_TOKEN`
    - für SMS: `SMTP2GO_API_KEY`, optional `SMTP2GO_SMS_SENDER`
-   - optional `MCP_BIND_ADDR` / `MCP_HOST_PORT`, falls die Standardwerte nicht passen
+   - `MCP_BIND_ADDR` auf die Host-IP setzen, über die der Reverse-Proxy den Container erreicht (Standard `127.0.0.1`), optional `MCP_HOST_PORT`
 4. **Deploy the stack**
 5. Für ein Update später: im Stack auf **Pull and redeploy** klicken - das zieht jetzt zuverlässig das aktuelle Image aus der Registry (kein lokaler Build mehr nötig, siehe oben)
 
@@ -76,7 +77,7 @@ Da `docker-compose.yml` alle Werte ausschliesslich über `${VARIABLE}`-Platzhalt
 
 ## Netzwerk / Reverse-Proxy
 
-Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (alle Interfaces, wie bei allen MCP-Stacks); der Zugriff ist durch das Bearer-Token geschützt. Für den Zugriff aus einer Cloud-Claude-Session braucht es zusätzlich:
+Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Host. Soll der Reverse-Proxy den Dienst über die Host-IP erreichen, `MCP_BIND_ADDR` auf diese IP setzen (nicht `0.0.0.0`); der Zugriff ist zusätzlich durch das Bearer-Token geschützt. Für den Zugriff aus einer Cloud-Claude-Session braucht es:
 
 1. Eine eigene Subdomain (z.B. `zammad-mcp.deine-domain.ch`)
 2. Einen Reverse-Proxy (Plesk/nginx) mit TLS-Zertifikat, der auf `<Host-IP>:8420` weiterleitet (Endpoint-Pfad: `/mcp`)
@@ -84,8 +85,15 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 
 ## Sicherheit
 
-- Der HTTP-Modus startet nur, wenn `MCP_AUTH_TOKEN` gesetzt ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
-- Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_AUTH_TOKEN>` mitschicken, sonst Antwort `401 unauthorized`.
+- Der HTTP-Modus startet nur, wenn `MCP_AUTH_TOKEN` gesetzt und mindestens 32 Zeichen lang ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
+- Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_AUTH_TOKEN>` mitschicken, sonst Antwort `401 unauthorized`. Der Vergleich ist timing-sicher (`hmac.compare_digest`).
+- Brute-Force-Bremse: nach 10 falschen Tokens innerhalb von 10 Minuten antworten unauthentifizierte Requests mit `429` (Header `Retry-After`); Requests mit gültigem Token werden nie gebremst. Einfacher In-Memory-Zähler über alle Quellen, Fehlversuche stehen mit Quelladresse im Container-Log (`zammad_mcp.auth`). Zusätzlich empfohlen: `limit_req` im Reverse-Proxy.
+- Tools mit Aussenwirkung haben ein confirm-Gate: `forward_ticket`, `send_sms`, `delete_ticket_article`, `merge_ticket`, `set_article_internal` (bei `internal=false`) und `set_ticket_customer` liefern ohne `confirm=true` nur eine Vorschau und ändern bzw. senden nichts.
+- Ticket- und Anhangsinhalte stammen von Dritten (E-Mails) und können Anweisungen enthalten (Prompt Injection). Die Rückgaben von `get_ticket`, `download_attachment`, `get_attachment_text`, `find_in_attachments` und der Vorschauen tragen deshalb einen `content_notice`; die confirm-Gates sind die eigentliche Absicherung.
+- Alle IDs und Ticketnummern, die in Zammad-API-Pfade eingesetzt werden, werden im Code validiert (ganze Zahlen bzw. nur Ziffern), unabhängig von der Schema-Prüfung des MCP-SDK (dafür `mcp >= 1.10`).
+- Fehlermeldungen an den Client enthalten nur den Statuscode und eine generische Meldung - keine Zammad-URL, keinen Response-Text, keine gesendete Payload. Details stehen im Container-Log (`zammad_mcp.api`).
+- URL-Downloads (`forward_ticket` mit `attachment_urls`): nur http/https ohne Zugangsdaten, Hostname wird einmal aufgelöst und muss ausschliesslich auf öffentliche Adressen zeigen; die Verbindung wird an die geprüfte IP gepinnt (Host-Header und SNI = Originalname, keine Proxy-Umgebung), jeder Redirect-Hop wird erneut geprüft (kein DNS-Rebinding-Fenster). Grössenlimit `URL_ATTACHMENT_MAX_BYTES`, nur PDFs.
+- Container läuft als User `app` (UID 10001), Base-Image per Digest und `requirements.txt` exakt gepinnt, Compose mit `no-new-privileges` und `cap_drop: ALL`.
 - Einzige Ausnahme ist `GET /healthz` für den Docker-Healthcheck: ohne Token, liefert nur `{"status": "ok"}` (keine Version, keine Konfiguration, keine Abfrage der Zammad-API). Das Image bringt den `HEALTHCHECK` mit (interval 30s, timeout 5s, start_period 15s, retries 3).
 - `.env` ist in `.gitignore` und wird nie committet - Secrets landen nur als Umgebungsvariablen (lokal in `.env`, in der Cloud in der Portainer-Stack-Konfiguration).
 
@@ -100,7 +108,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 | `get_open_tickets` | Alle offenen Tickets (new/open), inkl. Gruppe, Priorität, Kunde, Owner |
 | `get_pending_reached_tickets` | Pending-Reminder-Tickets, deren Wartezeit abgelaufen ist |
 | `list_overviews` | Ticket-Übersichten/Kategorien auflisten |
-| `download_attachment` | Anhang herunterladen (als base64) |
+| `download_attachment` | Anhang herunterladen (als base64, max. `ATTACHMENT_TEXT_MAX_BYTES`) |
 | `get_attachment_text` | Text eines Anhangs (PDF, XLSX, DOCX, CSV, TXT, Scans und Bilder per OCR) serverseitig extrahieren, mit Paging über `offset`/`max_chars` und `page_from`/`page_to` |
 | `find_in_attachments` | Tickets per Suche finden und alle Anhänge nach einem Begriff (oder Regex) durchsuchen, optional inkl. OCR |
 | `find_invoice_aggregation_tickets` | Tickets mit Invoice-Aggregation-Excel-Anhängen |
@@ -108,17 +116,17 @@ Der Container bindet standardmässig auf `0.0.0.0:8420` auf dem Docker-Host (all
 | `list_groups` | Alle aktiven Gruppen auflisten |
 | `set_ticket_group` | Ticket in eine andere Gruppe verschieben |
 | `set_ticket_owner` | Ticket einem Agent zuweisen (E-Mail, Login oder Name; `none` entfernt die Zuweisung) |
-| `set_ticket_customer` | Kunde eines Tickets wechseln (E-Mail, Login oder Name eines bestehenden Users; Organisation wird mitgesetzt, kein automatisches Anlegen) |
+| `set_ticket_customer` | Kunde eines Tickets wechseln (E-Mail, Login oder Name eines bestehenden Users; Organisation wird mitgesetzt, kein automatisches Anlegen). Ohne `confirm=true` nur Vorschau |
 | `update_customer_name` | Vor- und/oder Nachname eines Kunden korrigieren (per E-Mail oder Ticket) |
 | `add_ticket_note` | Interne Notiz hinzufügen |
 | `update_ticket_state` | Ticket-Status ändern |
 | `set_ticket_pending` | Ticket auf "pending reminder" setzen |
-| `merge_ticket` | Zwei Tickets zusammenführen |
-| `delete_ticket_article` | Ticket-Artikel löschen |
-| `set_article_internal` | Bestehenden Ticket-Artikel auf intern (oder öffentlich) stellen |
+| `merge_ticket` | Zwei Tickets zusammenführen (`master_ticket_number` nur Ziffern). Ohne `confirm=true` nur Vorschau von Quell- und Zielticket |
+| `delete_ticket_article` | Ticket-Artikel löschen. Ohne `confirm=true` nur Vorschau des Artikels |
+| `set_article_internal` | Bestehenden Ticket-Artikel auf intern (direkt) oder öffentlich stellen (`internal=false` macht ihn kundensichtbar: ohne `confirm=true` nur Vorschau) |
 | `send_sms` | SMS über das SMS-Gateway von SMTP2GO senden. Ohne `confirm=true` nur Vorschau. Ohne `to` wird die Mobilnummer des Ticket-Kunden verwendet; mit `ticket_id` wird der Versand als interne Notiz im Ticket dokumentiert |
 | `list_received_sms` | Bei SMTP2GO eingegangene SMS (Antworten) abfragen, read-only |
-| `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten; mit `attachment_urls` werden PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt (nur oeffentliche http/https-Adressen, max. 20 MB, via `URL_ATTACHMENT_MAX_BYTES` anpassbar) |
+| `forward_ticket` | Ticket-Artikel per E-Mail weiterleiten. Ohne `confirm=true` wird nichts gesendet und nichts heruntergeladen, nur Vorschau (Empfänger, Betreff, Anhangsliste, Textauszug). `to` = genau eine Adresse, `body` = Klartext (wird HTML-escaped). Mit `attachment_urls` werden PDFs, die nur als Link in der Mail stehen (z.B. Online-Rechnungen), serverseitig geladen und im Original angehaengt (nur oeffentliche http/https-Adressen, Verbindung an die geprüfte IP gepinnt, max. 20 MB, via `URL_ATTACHMENT_MAX_BYTES` anpassbar). Schlägt ein Download fehl, wird nicht gesendet |
 
 ## SMS (SMTP2GO)
 

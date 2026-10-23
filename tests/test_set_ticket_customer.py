@@ -48,14 +48,14 @@ def api(monkeypatch):
 
 
 def test_change_customer_by_email_sets_organization(api):
-    r = zm.set_ticket_customer(7, "ANNA@kunde.example.com")
+    r = zm.set_ticket_customer(7, "ANNA@kunde.example.com", confirm=True)
     assert r["success"] and r["old_customer"] == "Beat Beispiel <beat@example.com>"
     assert r["new_customer"] == "Anna Muster <anna@kunde.example.com>"
     assert api == [("https://zammad.example.com/api/v1/tickets/7", {"customer_id": 10, "organization_id": 5})]
 
 
 def test_change_customer_by_login_without_organization(api, monkeypatch):
-    zm.set_ticket_customer(7, "annam")
+    zm.set_ticket_customer(7, "annam", confirm=True)
     assert api[-1][1] == {"customer_id": 12, "organization_id": None}
 
 
@@ -76,8 +76,16 @@ def test_unknown_or_inactive_is_rejected(api):
 
 
 def test_same_customer_is_noop(api):
-    r = zm.set_ticket_customer(7, "beat")
+    r = zm.set_ticket_customer(7, "beat", confirm=True)
     assert r["unchanged"] is True and api == []
+
+
+def test_preview_without_confirm_changes_nothing(api):
+    r = zm.set_ticket_customer(7, "anna@kunde.example.com")
+    assert r["preview"] is True and r["changed"] is False
+    assert r["old_customer"] == "Beat Beispiel <beat@example.com>"
+    assert r["new_customer"] == "Anna Muster <anna@kunde.example.com>"
+    assert api == []
 
 
 def test_tool_registered():
