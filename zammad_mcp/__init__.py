@@ -551,11 +551,78 @@ def set_ticket_owner(ticket_id: int, owner: str) -> dict:
         owner_id, label = 1, None
     else:
         owner_id, label = _resolve_agent(owner)
+        if owner_id == _mcp_user_id():
+            raise ValueError("Tickets duerfen nicht dem MCP-User zugewiesen werden")
     url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
     response = httpx.put(url, headers=get_headers(), json={"owner_id": owner_id}, timeout=30)
     if not response.is_success:
         return _api_error_result(response)
     return {"success": True, "ticket_id": ticket_id, "owner": label}
+
+
+# ---------------------------------------------------------------------------
+# Owner-Sperre: Tickets nie dem API-User des MCP zuweisen
+# ---------------------------------------------------------------------------
+# Zammad setzt bei Aktionen ueber die API (Ticket anlegen, Artikel schreiben,
+# Status aendern) unter Umstaenden den ausfuehrenden User als Owner - das ist
+# hier der technische MCP-User. Nach jedem schreibenden Tool wird der Owner
+# geprueft und auf ZAMMAD_DEFAULT_OWNER umgehaengt (leer = keine Zuweisung).
+
+ZAMMAD_DEFAULT_OWNER = os.environ.get("ZAMMAD_DEFAULT_OWNER", "").strip()
+
+
+def _mcp_user_id() -> int | None:
+    """ID des Zammad-Users hinter ZAMMAD_TOKEN, gecacht. None, wenn nicht ermittelbar."""
+    if "mcp_user_id" not in _CACHE:
+        try:
+            _CACHE["mcp_user_id"] = api_get("/users/me").get("id")
+        except Exception:
+            return None
+    return _CACHE["mcp_user_id"]
+
+
+def _default_owner() -> tuple[int, str | None]:
+    """(owner_id, label) aus ZAMMAD_DEFAULT_OWNER; leer = (1, None) = keine Zuweisung."""
+    if not ZAMMAD_DEFAULT_OWNER:
+        return 1, None
+    if "default_owner" not in _CACHE:
+        owner_id, label = _resolve_agent(ZAMMAD_DEFAULT_OWNER)
+        if owner_id == _mcp_user_id():
+            raise ValueError("ZAMMAD_DEFAULT_OWNER zeigt auf den MCP-User selbst")
+        _CACHE["default_owner"] = (owner_id, label)
+    return _CACHE["default_owner"]
+
+
+def _guard_owner(ticket_id: int) -> dict | None:
+    """Haengt das Ticket um, falls es dem MCP-User gehoert. Gibt eine Info fuer das Tool-Ergebnis zurueck."""
+    mcp_id = _mcp_user_id()
+    if not mcp_id:
+        return {"ticket_id": ticket_id, "error": "MCP-User nicht ermittelbar, Owner nicht geprueft"}
+    try:
+        if api_get(f"/tickets/{ticket_id}").get("owner_id") != mcp_id:
+            return None
+    except Exception as e:
+        return {"ticket_id": ticket_id, "error": f"Owner nicht geprueft: {_exc_text(e)}"}
+    try:
+        owner_id, label = _default_owner()
+    except Exception as e:
+        owner_id, label = 1, None
+        reason = f"ZAMMAD_DEFAULT_OWNER ungueltig ({e}), Zuweisung entfernt"
+    else:
+        reason = None
+    url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
+    response = httpx.put(url, headers=get_headers(), json={"owner_id": owner_id}, timeout=30)
+    if not response.is_success and owner_id != 1:
+        reason = f"Zuweisung an {label} abgelehnt (HTTP {response.status_code}), Zuweisung entfernt"
+        owner_id, label = 1, None
+        response = httpx.put(url, headers=get_headers(), json={"owner_id": 1}, timeout=30)
+    if not response.is_success:
+        _log_api_failure(response)
+        return {"ticket_id": ticket_id, "error": f"Ticket gehoert dem MCP-User, Umhaengen fehlgeschlagen (HTTP {response.status_code})"}
+    info = {"ticket_id": ticket_id, "owner": label or "keine Zuweisung"}
+    if reason:
+        info["hinweis"] = reason
+    return info
 
 
 def _resolve_customer(customer: str) -> dict:
@@ -882,6 +949,7 @@ def merge_ticket(ticket_id: int, master_ticket_number: str, confirm: bool = Fals
     return {
         "success": True,
         "merged_ticket_id": ticket_id,
+        "master_ticket_id": master.get("id"),
         "master_ticket_number": master_ticket_number,
         **preview,
         "result": response.json() if response.content else None,
@@ -2155,6 +2223,13 @@ def find_in_attachments(ticket_query: str, pattern: str, regex: bool = False, li
 
 server = Server("zammad-connector", version=__version__)
 
+# Schreibende Ticket-Tools, nach denen der Owner geprueft wird (siehe _guard_owner)
+OWNER_GUARDED_TOOLS = {
+    "create_ticket", "set_ticket_group", "set_ticket_customer", "add_ticket_note",
+    "update_ticket_state", "update_ticket_title", "set_ticket_pending", "merge_ticket",
+    "forward_ticket",
+}
+
 TOOL_FUNCS = {
     "get_version": get_version,
     "search_tickets": search_tickets,
@@ -2463,6 +2538,22 @@ async def call_tool(name, arguments):
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: func(**(arguments or {})))
+        if name in OWNER_GUARDED_TOOLS and isinstance(result, dict) and result.get("success"):
+            if name == "merge_ticket":
+                tid = result.get("master_ticket_id")
+            else:
+                tid = result.get("ticket_id") or (arguments or {}).get("ticket_id")
+            try:
+                tid = int(tid)
+            except (TypeError, ValueError):
+                tid = 0
+            fixes = []
+            for tid in [tid] if tid > 0 else []:
+                info = await loop.run_in_executor(None, _guard_owner, tid)
+                if info:
+                    fixes.append(info)
+            if fixes:
+                result["owner_korrigiert"] = fixes
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except httpx.HTTPError as e:
         # Statuscode + generische Meldung; URL, Response-Text und Payload nur im Container-Log

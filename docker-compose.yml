@@ -18,6 +18,8 @@ services:
       - ZAMMAD_URL=${ZAMMAD_URL}
       - ZAMMAD_TOKEN=${ZAMMAD_TOKEN}
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      # Owner fuer Tickets, die Zammad dem MCP-User zuweisen wuerde (leer = keine Zuweisung)
+      - ZAMMAD_DEFAULT_OWNER=${ZAMMAD_DEFAULT_OWNER:-}
       # SMS ueber SMTP2GO (optional, ohne Key sind nur die SMS-Tools ohne Funktion)
       - SMTP2GO_API_KEY=${SMTP2GO_API_KEY:-}
       - SMTP2GO_SMS_SENDER=${SMTP2GO_SMS_SENDER:-}

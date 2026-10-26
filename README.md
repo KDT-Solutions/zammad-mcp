@@ -11,6 +11,7 @@ Alle Zugangsdaten und Einstellungen (inkl. der URL der eigenen Zammad-Instanz) w
 | `ZAMMAD_URL` | ja | – (muss gesetzt werden) | Basis-URL der Zammad-Instanz |
 | `ZAMMAD_TOKEN` | ja | – | Zammad API-Token (Bearer für die Zammad-REST-API) |
 | `MCP_AUTH_TOKEN` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints, mindestens 32 Zeichen (z.B. `openssl rand -base64 48`). Ohne oder mit zu kurzem Token startet der Server nicht (fail-safe) |
+| `ZAMMAD_DEFAULT_OWNER` | nein | leer | Agent (E-Mail, Login oder 'Vorname Nachname'), dem ein Ticket zugewiesen wird, falls Zammad es beim Schreiben über das MCP dem MCP-User zuweist. Leer = Zuweisung wird entfernt. Der MCP-User selbst wird nie als Owner gesetzt |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
 | `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping). Für den Zugriff des Reverse-Proxys über die Host-IP auf diese IP setzen (nicht `0.0.0.0`) |
