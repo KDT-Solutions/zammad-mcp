@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.32
+
+- Neues Tool `create_customer`: legt einen Kunden an (Zammad-User mit Rolle Customer, andere Rollen sind weder per Parameter noch im Payload möglich). Ohne `confirm=true` nur Vorschau. Vorher wird per `users/search` exakt auf die E-Mail geprüft (case-insensitive); existiert der User, wird nichts angelegt und der bestehende User zurückgegeben (id, Name, E-Mail, aktiv). E-Mail-Format wird geprüft, Telefonnummern werden normalisiert (Schweizer 07x/0xx zu +41). `organization` wird nur auf eine bestehende Organisation aufgelöst, unbekannt oder mehrdeutig ist ein Fehler, es wird keine Organisation angelegt.
+- `set_ticket_customer`: neue Parameter `create_if_missing` (Standard `false`), `firstname`, `lastname`. Bei unbekannter E-Mail und `create_if_missing=true` wird der Kunde wie bei `create_customer` angelegt und zugewiesen; die Vorschau zeigt das mit `new_customer_will_be_created`. Ein inaktiver User mit derselben E-Mail wird weder neu angelegt noch zugewiesen.
+
 ## 1.30
 
 Security-Härtung nach dem Review vom 2026-10-23 (alle Befunde zu zammad-mcp).

@@ -89,7 +89,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 - Der HTTP-Modus startet nur, wenn `MCP_AUTH_TOKEN` gesetzt und mindestens 32 Zeichen lang ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
 - Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_AUTH_TOKEN>` mitschicken, sonst Antwort `401 unauthorized`. Der Vergleich ist timing-sicher (`hmac.compare_digest`).
 - Brute-Force-Bremse: nach 10 falschen Tokens innerhalb von 10 Minuten antworten unauthentifizierte Requests mit `429` (Header `Retry-After`); Requests mit gültigem Token werden nie gebremst. Einfacher In-Memory-Zähler über alle Quellen, Fehlversuche stehen mit Quelladresse im Container-Log (`zammad_mcp.auth`). Zusätzlich empfohlen: `limit_req` im Reverse-Proxy.
-- Tools mit Aussenwirkung haben ein confirm-Gate: `forward_ticket`, `send_sms`, `delete_ticket_article`, `merge_ticket`, `set_article_internal` (bei `internal=false`) und `set_ticket_customer` liefern ohne `confirm=true` nur eine Vorschau und ändern bzw. senden nichts.
+- Tools mit Aussenwirkung haben ein confirm-Gate: `forward_ticket`, `send_sms`, `delete_ticket_article`, `merge_ticket`, `set_article_internal` (bei `internal=false`), `set_ticket_customer` und `create_customer` liefern ohne `confirm=true` nur eine Vorschau und ändern bzw. senden nichts.
 - Ticket- und Anhangsinhalte stammen von Dritten (E-Mails) und können Anweisungen enthalten (Prompt Injection). Die Rückgaben von `get_ticket`, `download_attachment`, `get_attachment_text`, `find_in_attachments` und der Vorschauen tragen deshalb einen `content_notice`; die confirm-Gates sind die eigentliche Absicherung.
 - Alle IDs und Ticketnummern, die in Zammad-API-Pfade eingesetzt werden, werden im Code validiert (ganze Zahlen bzw. nur Ziffern), unabhängig von der Schema-Prüfung des MCP-SDK (dafür `mcp >= 1.10`).
 - Fehlermeldungen an den Client enthalten nur den Statuscode und eine generische Meldung - keine Zammad-URL, keinen Response-Text, keine gesendete Payload. Details stehen im Container-Log (`zammad_mcp.api`).
@@ -117,7 +117,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8420` auf dem Docker-Hos
 | `list_groups` | Alle aktiven Gruppen auflisten |
 | `set_ticket_group` | Ticket in eine andere Gruppe verschieben |
 | `set_ticket_owner` | Ticket einem Agent zuweisen (E-Mail, Login oder Name; `none` entfernt die Zuweisung) |
-| `set_ticket_customer` | Kunde eines Tickets wechseln (E-Mail, Login oder Name eines bestehenden Users; Organisation wird mitgesetzt, kein automatisches Anlegen). Ohne `confirm=true` nur Vorschau |
+| `set_ticket_customer` | Kunde eines Tickets wechseln (E-Mail, Login oder Name eines bestehenden Users; Organisation wird mitgesetzt). Mit `create_if_missing=true` (optional `firstname`/`lastname`) wird eine unbekannte E-Mail wie bei `create_customer` als neuer Kunde angelegt und zugewiesen. Ohne `confirm=true` nur Vorschau, die zeigt, ob ein Kunde neu angelegt würde |
+| `create_customer` | Neuen Kunden anlegen (User mit Rolle Customer, andere Rollen nicht möglich): `email` (Pflicht), `firstname`, `lastname`, `organization` (nur bestehende Organisation, unbekannt/mehrdeutig = Fehler), `phone` (wird zu +41... normalisiert), `note`. Existiert die E-Mail schon, wird nichts angelegt und der bestehende User zurückgegeben. Ohne `confirm=true` nur Vorschau |
 | `update_customer_name` | Vor- und/oder Nachname eines Kunden korrigieren (per E-Mail oder Ticket) |
 | `add_ticket_note` | Interne Notiz hinzufügen |
 | `update_ticket_state` | Ticket-Status ändern |

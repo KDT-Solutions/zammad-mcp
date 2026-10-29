@@ -647,34 +647,187 @@ def _resolve_customer(customer: str) -> dict:
     return matches[0]
 
 
-def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False) -> dict:
+_EMAIL_RE = re.compile(r"[^\s<>@,;\"']+@[^\s<>@,;\"']+\.[^\s<>@,;\"'.]{2,}")
+
+
+def _validate_email(email: str) -> str:
+    """Genau eine nackte E-Mail-Adresse (ohne Name, ohne Liste), kleingeschrieben."""
+    raw = (email or "").strip()
+    if not raw:
+        raise ValueError("E-Mail fehlt")
+    if not _EMAIL_RE.fullmatch(raw) or ".." in raw:
+        raise ValueError(f"Ungueltige E-Mail-Adresse: '{raw}'")
+    return raw.lower()
+
+
+def _find_user_by_email(email: str) -> dict | None:
+    """User mit exakt dieser E-Mail (case-insensitive), aktiv oder inaktiv. Mehrere Treffer sind ein Fehler."""
+    q = email.strip().lower()
+    users = api_get("/users/search", params={"query": q, "limit": 50})
+    matches = [u for u in users if (u.get("email") or "").strip().lower() == q]
+    if len(matches) > 1:
+        ids = ", ".join(str(u["id"]) for u in matches)
+        raise ValueError(f"E-Mail '{email}' mehrdeutig ({len(matches)} User gefunden: {ids})")
+    return matches[0] if matches else None
+
+
+def _resolve_organization(organization: str) -> dict:
+    """Name einer bestehenden, aktiven Organisation -> Organisation-Dict. Exakter Treffer (case-insensitive),
+    kein stiller Fallback und keine Neuanlage: unbekannt oder mehrdeutig ist ein Fehler."""
+    query = (organization or "").strip()
+    if not query:
+        raise ValueError("Organisation fehlt")
+    orgs = [o for o in api_get("/organizations/search", params={"query": query, "limit": 50}) if o.get("active", True)]
+    matches = [o for o in orgs if (o.get("name") or "").strip().lower() == query.lower()]
+    found = ", ".join(sorted(o.get("name") or str(o.get("id")) for o in orgs)) or "keine"
+    if not matches:
+        raise ValueError(f"Organisation '{organization}' nicht gefunden (es wird keine neue angelegt). Gefundene Organisationen: {found}")
+    if len(matches) > 1:
+        raise ValueError(f"Organisation '{organization}' mehrdeutig. Gefundene Organisationen: {found}")
+    return matches[0]
+
+
+def _customer_summary(u: dict) -> dict:
+    name = " ".join(x for x in (u.get("firstname"), u.get("lastname")) if x).strip()
+    return {"id": u.get("id"), "name": name or None, "email": u.get("email"), "active": bool(u.get("active", True))}
+
+
+def _prepare_customer(email: str, firstname: str = None, lastname: str = None, organization: str = None,
+                      phone: str = None, note: str = None) -> tuple[dict | None, dict]:
+    """Eingaben pruefen und Payload fuer POST /users bauen. Gibt (bestehender User oder None, Payload) zurueck.
+    Die Rolle ist fest 'Customer', es gibt bewusst keinen Parameter fuer andere Rollen."""
+    email = _validate_email(email)
+    payload = {"email": email, "login": email, "roles": ["Customer"]}
+    for key, value in (("firstname", firstname), ("lastname", lastname), ("note", note)):
+        if value is not None and str(value).strip():
+            payload[key] = str(value).strip()
+    if phone is not None and str(phone).strip():
+        payload["phone"] = _normalize_phone(str(phone), landline=True)
+    org_label = None
+    if organization is not None and str(organization).strip():
+        org = _resolve_organization(str(organization))
+        payload["organization_id"] = org["id"]
+        org_label = org.get("name")
+    existing = _find_user_by_email(email)
+    return existing, {"payload": payload, "organization": org_label}
+
+
+def _post_customer(payload: dict) -> dict:
+    """Kunden anlegen (POST /users mit dem Token des MCP-Users). Rollen werden hier nochmals erzwungen."""
+    payload = {**payload, "roles": ["Customer"]}
+    payload.pop("role_ids", None)
+    response = httpx.post(f"{ZAMMAD_URL}/api/v1/users", headers=get_headers(), json=payload, timeout=30)
+    if not response.is_success:
+        return _api_error_result(response)
+    return {"success": True, "user": response.json()}
+
+
+def _preview_customer(prepared: dict) -> dict:
+    p = prepared["payload"]
+    return {
+        "email": p["email"],
+        "firstname": p.get("firstname"),
+        "lastname": p.get("lastname"),
+        "organization": prepared["organization"],
+        "organization_id": p.get("organization_id"),
+        "phone": p.get("phone"),
+        "note": p.get("note"),
+        "roles": p["roles"],
+    }
+
+
+def create_customer(email: str, firstname: str = None, lastname: str = None, organization: str = None,
+                    phone: str = None, note: str = None, confirm: bool = False) -> dict:
+    """Neuen Kunden (Zammad-User mit Rolle Customer) anlegen. Existiert die E-Mail schon, wird nichts angelegt,
+    sondern der bestehende User zurueckgegeben. Ohne confirm=true nur Vorschau."""
+    existing, prepared = _prepare_customer(email, firstname, lastname, organization, phone, note)
+    if existing:
+        return {"success": True, "created": False, "already_existed": True, **_customer_summary(existing)}
+    if not confirm:
+        return {"preview": True, "created": False,
+                "hinweis": "Nichts angelegt. Zum Anlegen des Kunden mit confirm=true erneut aufrufen.",
+                "new_customer": _preview_customer(prepared)}
+    res = _post_customer(prepared["payload"])
+    if not res.get("success"):
+        # Parallel angelegt oder Suchindex noch nicht nachgefuehrt: bestehenden User zurueckgeben
+        if res.get("status_code") == 422:
+            existing = _find_user_by_email(prepared["payload"]["email"])
+            if existing:
+                return {"success": True, "created": False, "already_existed": True, **_customer_summary(existing)}
+        return res
+    return {"success": True, "created": True, "already_existed": False, **_customer_summary(res["user"])}
+
+
+def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False, create_if_missing: bool = False,
+                        firstname: str = None, lastname: str = None) -> dict:
     """Kunde eines Tickets wechseln. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden,
-    aktiven Users. Die Organisation des Tickets wird wie in der Zammad-Oberflaeche auf die Organisation
-    des neuen Kunden gesetzt (bzw. geleert, wenn er keine hat). Ohne confirm=true nur Vorschau."""
+    aktiven Users. Mit create_if_missing=true und einer unbekannten E-Mail wird der Kunde wie bei
+    create_customer angelegt (Rolle Customer, ohne Organisation). Die Organisation des Tickets wird wie in
+    der Zammad-Oberflaeche auf die Organisation des neuen Kunden gesetzt (bzw. geleert, wenn er keine hat).
+    Ohne confirm=true nur Vorschau."""
     ticket_id = _int_id(ticket_id, "ticket_id")
     ticket = api_get(f"/tickets/{ticket_id}")
-    new = _resolve_customer(customer)
+    prepared = None
+    try:
+        new = _resolve_customer(customer)
+    except ValueError as e:
+        if not create_if_missing or "nicht gefunden" not in str(e):
+            raise
+        if "@" not in (customer or ""):
+            raise ValueError(f"{e}. Fuer create_if_missing=true muss customer eine E-Mail-Adresse sein")
+        existing, prepared = _prepare_customer(customer, firstname, lastname)
+        if existing and not existing.get("active", True):
+            raise ValueError(
+                f"User mit E-Mail '{existing.get('email')}' existiert bereits (id {existing['id']}), ist aber "
+                f"inaktiv - wird nicht neu angelegt und nicht zugewiesen"
+            )
+        new = existing
+        if existing:
+            prepared = None
     old_id = ticket.get("customer_id")
     old_label = _user_label(old_id) if old_id and old_id != 1 else None
-    new_label = _user_label(new["id"], {"User": {str(new["id"]): new}})
-    if old_id == new["id"]:
-        return {"success": True, "ticket_id": ticket_id, "unchanged": True, "customer": new_label}
+    if new is not None:
+        new_label = _user_label(new["id"], {"User": {str(new["id"]): new}})
+        if old_id == new["id"]:
+            return {"success": True, "ticket_id": ticket_id, "unchanged": True, "customer": new_label}
+    else:
+        p = prepared["payload"]
+        name = " ".join(x for x in (p.get("firstname"), p.get("lastname")) if x).strip()
+        new_label = f"{name} <{p['email']}>" if name else p["email"]
     preview = {
         "ticket_id": ticket_id,
         "ticket_number": ticket.get("number"),
         "ticket_title": ticket.get("title"),
         "old_customer": old_label,
         "new_customer": new_label,
-        "new_organization_id": new.get("organization_id"),
+        "new_organization_id": new.get("organization_id") if new is not None else None,
     }
+    if prepared is not None:
+        preview["new_customer_will_be_created"] = True
+        preview["customer_to_create"] = _preview_customer(prepared)
     if not confirm:
-        return {"preview": True, "changed": False,
-                "hinweis": "Nichts geaendert. Zum Wechseln des Kunden mit confirm=true erneut aufrufen.", **preview}
+        hinweis = "Nichts geaendert. Zum Wechseln des Kunden mit confirm=true erneut aufrufen."
+        if prepared is not None:
+            hinweis = (f"Nichts geaendert. Der Kunde {new_label} existiert noch nicht und wird mit confirm=true "
+                       f"neu angelegt (Rolle Customer) und dem Ticket zugewiesen.")
+        return {"preview": True, "changed": False, "hinweis": hinweis, **preview}
+    created = None
+    if prepared is not None:
+        res = _post_customer(prepared["payload"])
+        if not res.get("success"):
+            return res
+        new = res["user"]
+        created = _customer_summary(new)
+        new_label = _user_label(new["id"], {"User": {str(new["id"]): new}})
     payload = {"customer_id": new["id"], "organization_id": new.get("organization_id")}
     url = f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}"
     response = httpx.put(url, headers=get_headers(), json=payload, timeout=30)
     if not response.is_success:
-        return _api_error_result(response)
+        result = _api_error_result(response)
+        if created:
+            result["customer_created"] = created
+            result["hinweis"] = "Kunde wurde angelegt, die Zuweisung zum Ticket ist aber fehlgeschlagen"
+        return result
     updated = response.json()
     result = {
         "success": True,
@@ -683,6 +836,8 @@ def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False) ->
         "old_customer": old_label,
         "new_customer": new_label,
     }
+    if created:
+        result["customer_created"] = created
     if updated.get("customer_id") != new["id"]:
         result["success"] = False
         result["error"] = f"Zammad hat den Kunden nicht uebernommen (customer_id ist {updated.get('customer_id')})"
@@ -1340,20 +1495,22 @@ _GSM_BASIC = set(
 _GSM_EXT = set("^{}\\[~]|€\f")
 
 
-def _normalize_phone(number: str) -> str:
+def _normalize_phone(number: str, landline: bool = False) -> str:
     """Nummer ins E.164-Format (+<Ziffern>) bringen. Internationales Format (+41... oder 0041...)
-    oder Schweizer Mobilnummer 07x 123 45 67 (wird zu +417x...). Andere nationale Nummern werden abgelehnt."""
+    oder Schweizer Mobilnummer 07x 123 45 67 (wird zu +417x...). Mit landline=True auch Schweizer
+    Festnetznummern 0xx 123 45 67 (wird zu +41xx...). Andere nationale Nummern werden abgelehnt."""
     raw = (number or "").strip()
     if not raw:
         raise ValueError("Telefonnummer fehlt")
     cleaned = re.sub(r"[\s\-./()]", "", raw)
     if cleaned.startswith("00"):
         cleaned = "+" + cleaned[2:]
-    elif re.fullmatch(r"07\d{8}", cleaned):
-        cleaned = "+41" + cleaned[1:]  # Schweizer Mobilnummer
+    elif re.fullmatch(r"07\d{8}", cleaned) or (landline and re.fullmatch(r"0[1-9]\d{8}", cleaned)):
+        cleaned = "+41" + cleaned[1:]  # Schweizer Nummer
     if not cleaned.startswith("+"):
+        expected = "Schweizer Nummer (079 123 45 67, 044 123 45 67)" if landline else "Schweizer Mobilnummer (079 123 45 67)"
         raise ValueError(
-            f"Telefonnummer '{number}' nicht erkannt. Erwartet Schweizer Mobilnummer (079 123 45 67) "
+            f"Telefonnummer '{number}' nicht erkannt. Erwartet {expected} "
             f"oder internationales Format (+41791234567, 0041791234567)"
         )
     digits = cleaned[1:]
@@ -2247,6 +2404,7 @@ TOOL_FUNCS = {
     "set_ticket_group": set_ticket_group,
     "set_ticket_owner": set_ticket_owner,
     "set_ticket_customer": set_ticket_customer,
+    "create_customer": create_customer,
     "update_customer_name": update_customer_name,
     "add_ticket_note": add_ticket_note,
     "update_ticket_state": update_ticket_state,
@@ -2408,12 +2566,28 @@ async def list_tools():
         ),
         Tool(
             name="set_ticket_customer",
-            description="Kunde eines Tickets wechseln. Ohne confirm=true nur Vorschau (alter und neuer Kunde), es wird nichts geaendert. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden, aktiven Users; unbekannte oder mehrdeutige Angaben werden abgelehnt, es wird kein neuer Kunde angelegt. Die Organisation des Tickets wird auf die des neuen Kunden gesetzt. Bestehende Artikel bleiben unveraendert.",
+            description="Kunde eines Tickets wechseln. Ohne confirm=true nur Vorschau (alter und neuer Kunde), es wird nichts geaendert. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden, aktiven Users; unbekannte oder mehrdeutige Angaben werden abgelehnt. Mit create_if_missing=true und einer unbekannten E-Mail wird der Kunde wie bei create_customer neu angelegt (Rolle Customer, optional firstname/lastname) und dann zugewiesen; die Vorschau zeigt das mit new_customer_will_be_created. Die Organisation des Tickets wird auf die des neuen Kunden gesetzt. Bestehende Artikel bleiben unveraendert.",
             inputSchema={"type": "object", "properties": {
                 "ticket_id": {"type": "integer"},
-                "customer": {"type": "string", "description": "E-Mail, Login oder 'Vorname Nachname' des neuen Kunden"},
-                "confirm": {"type": "boolean", "default": False, "description": "true = wirklich wechseln, sonst nur Vorschau"},
+                "customer": {"type": "string", "description": "E-Mail, Login oder 'Vorname Nachname' des neuen Kunden (bei create_if_missing=true eine E-Mail)"},
+                "create_if_missing": {"type": "boolean", "default": False, "description": "true = unbekannte E-Mail als neuen Kunden anlegen"},
+                "firstname": {"type": "string", "description": "Vorname, nur fuer die Neuanlage"},
+                "lastname": {"type": "string", "description": "Nachname, nur fuer die Neuanlage"},
+                "confirm": {"type": "boolean", "default": False, "description": "true = wirklich wechseln (und ggf. anlegen), sonst nur Vorschau"},
             }, "required": ["ticket_id", "customer"]},
+        ),
+        Tool(
+            name="create_customer",
+            description="Neuen Kunden in Zammad anlegen (User mit Rolle Customer, andere Rollen sind nicht moeglich). Ohne confirm=true nur Vorschau der Daten, es wird nichts angelegt. Existiert die E-Mail schon (exakter Abgleich), wird nichts angelegt und der bestehende User zurueckgegeben (id, Name, E-Mail, aktiv). organization = Name einer bestehenden Organisation; unbekannte oder mehrdeutige Organisationen werden abgelehnt, es wird keine neue angelegt. Telefonnummern werden ins Format +41... gebracht (079 123 45 67, 044 123 45 67 oder international).",
+            inputSchema={"type": "object", "properties": {
+                "email": {"type": "string"},
+                "firstname": {"type": "string"},
+                "lastname": {"type": "string"},
+                "organization": {"type": "string", "description": "Exakter Name einer bestehenden Organisation"},
+                "phone": {"type": "string"},
+                "note": {"type": "string", "description": "Notiz am Kunden"},
+                "confirm": {"type": "boolean", "default": False, "description": "true = wirklich anlegen, sonst nur Vorschau"},
+            }, "required": ["email"], "additionalProperties": False},
         ),
         Tool(
             name="update_customer_name",
