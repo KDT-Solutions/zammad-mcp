@@ -67,7 +67,7 @@ def test_preview_without_confirm_creates_nothing(api):
     assert r["preview"] is True and r["created"] is False
     assert r["new_customer"] == {
         "email": "neu@example.com", "firstname": "Nina", "lastname": "Neu", "organization": "Kunde AG",
-        "organization_id": 5, "phone": "+41441234567", "note": "Testnotiz", "roles": ["Customer"],
+        "organization_id": 5, "phone": "+41441234567", "mobile": None, "note": "Testnotiz", "roles": ["Customer"],
     }
     assert api == []
 
@@ -78,7 +78,7 @@ def test_confirm_creates_customer_role_only(api):
                  "name": "Nina", "email": "neu@example.com", "active": True}
     method, url, payload = api[0]
     assert (method, url) == ("POST", "https://zammad.example.com/api/v1/users")
-    assert payload["roles"] == ["Customer"] and payload["phone"] == "+41791234567"
+    assert payload["roles"] == ["Customer"] and payload["mobile"] == "+41791234567" and "phone" not in payload
     assert "organization_id" not in payload and len(api) == 1
 
 
@@ -172,3 +172,23 @@ def test_tool_registered():
     import asyncio
     assert "create_customer" in {t.name for t in asyncio.run(zm.list_tools())}
     assert zm.TOOL_FUNCS["create_customer"] is zm.create_customer
+
+
+def test_foreign_number_goes_to_phone(api):
+    r = zm.create_customer("neu@example.com", phone="+49 151 1234567")
+    assert r["new_customer"]["phone"] == "+491511234567" and r["new_customer"]["mobile"] is None
+
+
+def test_set_customer_create_with_all_infos(api):
+    r = zm.set_ticket_customer(7, "neu@example.com", create_if_missing=True, firstname="Nina", lastname="Neu",
+                               organization="Kunde AG", phone="079 123 45 67", note="Testnotiz", confirm=True)
+    assert r["success"]
+    payload = api[0][2]
+    assert payload["organization_id"] == 5 and payload["mobile"] == "+41791234567" and payload["note"] == "Testnotiz"
+    assert api[1][2] == {"customer_id": 99, "organization_id": 5}
+
+
+def test_set_customer_create_preview_shows_organization(api):
+    r = zm.set_ticket_customer(7, "neu@example.com", create_if_missing=True, organization="Kunde AG")
+    assert r["new_organization_id"] == 5 and r["customer_to_create"]["organization"] == "Kunde AG"
+    assert api == []

@@ -702,7 +702,9 @@ def _prepare_customer(email: str, firstname: str = None, lastname: str = None, o
         if value is not None and str(value).strip():
             payload[key] = str(value).strip()
     if phone is not None and str(phone).strip():
-        payload["phone"] = _normalize_phone(str(phone), landline=True)
+        number = _normalize_phone(str(phone), landline=True)
+        # Schweizer Mobilnummern ins Feld mobile (dort sucht send_sms), alles andere ins Feld phone
+        payload["mobile" if re.fullmatch(r"\+417\d{8}", number) else "phone"] = number
     org_label = None
     if organization is not None and str(organization).strip():
         org = _resolve_organization(str(organization))
@@ -731,6 +733,7 @@ def _preview_customer(prepared: dict) -> dict:
         "organization": prepared["organization"],
         "organization_id": p.get("organization_id"),
         "phone": p.get("phone"),
+        "mobile": p.get("mobile"),
         "note": p.get("note"),
         "roles": p["roles"],
     }
@@ -759,10 +762,11 @@ def create_customer(email: str, firstname: str = None, lastname: str = None, org
 
 
 def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False, create_if_missing: bool = False,
-                        firstname: str = None, lastname: str = None) -> dict:
+                        firstname: str = None, lastname: str = None, organization: str = None,
+                        phone: str = None, note: str = None) -> dict:
     """Kunde eines Tickets wechseln. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden,
     aktiven Users. Mit create_if_missing=true und einer unbekannten E-Mail wird der Kunde wie bei
-    create_customer angelegt (Rolle Customer, ohne Organisation). Die Organisation des Tickets wird wie in
+    create_customer angelegt (Rolle Customer, optional mit Organisation, Telefon und Notiz). Die Organisation des Tickets wird wie in
     der Zammad-Oberflaeche auf die Organisation des neuen Kunden gesetzt (bzw. geleert, wenn er keine hat).
     Ohne confirm=true nur Vorschau."""
     ticket_id = _int_id(ticket_id, "ticket_id")
@@ -775,7 +779,7 @@ def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False, cr
             raise
         if "@" not in (customer or ""):
             raise ValueError(f"{e}. Fuer create_if_missing=true muss customer eine E-Mail-Adresse sein")
-        existing, prepared = _prepare_customer(customer, firstname, lastname)
+        existing, prepared = _prepare_customer(customer, firstname, lastname, organization, phone, note)
         if existing and not existing.get("active", True):
             raise ValueError(
                 f"User mit E-Mail '{existing.get('email')}' existiert bereits (id {existing['id']}), ist aber "
@@ -800,7 +804,7 @@ def set_ticket_customer(ticket_id: int, customer: str, confirm: bool = False, cr
         "ticket_title": ticket.get("title"),
         "old_customer": old_label,
         "new_customer": new_label,
-        "new_organization_id": new.get("organization_id") if new is not None else None,
+        "new_organization_id": new.get("organization_id") if new is not None else prepared["payload"].get("organization_id"),
     }
     if prepared is not None:
         preview["new_customer_will_be_created"] = True
@@ -2566,19 +2570,22 @@ async def list_tools():
         ),
         Tool(
             name="set_ticket_customer",
-            description="Kunde eines Tickets wechseln. Ohne confirm=true nur Vorschau (alter und neuer Kunde), es wird nichts geaendert. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden, aktiven Users; unbekannte oder mehrdeutige Angaben werden abgelehnt. Mit create_if_missing=true und einer unbekannten E-Mail wird der Kunde wie bei create_customer neu angelegt (Rolle Customer, optional firstname/lastname) und dann zugewiesen; die Vorschau zeigt das mit new_customer_will_be_created. Die Organisation des Tickets wird auf die des neuen Kunden gesetzt. Bestehende Artikel bleiben unveraendert.",
+            description="Kunde eines Tickets wechseln. Ohne confirm=true nur Vorschau (alter und neuer Kunde), es wird nichts geaendert. customer = E-Mail, Login oder 'Vorname Nachname' eines bestehenden, aktiven Users; unbekannte oder mehrdeutige Angaben werden abgelehnt. Mit create_if_missing=true und einer unbekannten E-Mail wird der Kunde wie bei create_customer neu angelegt (Rolle Customer, optional firstname, lastname, organization, phone, note) und dann zugewiesen; die Vorschau zeigt das mit new_customer_will_be_created. Die Organisation des Tickets wird auf die des neuen Kunden gesetzt. Bestehende Artikel bleiben unveraendert.",
             inputSchema={"type": "object", "properties": {
                 "ticket_id": {"type": "integer"},
                 "customer": {"type": "string", "description": "E-Mail, Login oder 'Vorname Nachname' des neuen Kunden (bei create_if_missing=true eine E-Mail)"},
                 "create_if_missing": {"type": "boolean", "default": False, "description": "true = unbekannte E-Mail als neuen Kunden anlegen"},
                 "firstname": {"type": "string", "description": "Vorname, nur fuer die Neuanlage"},
                 "lastname": {"type": "string", "description": "Nachname, nur fuer die Neuanlage"},
+                "organization": {"type": "string", "description": "Exakter Name einer bestehenden Organisation, nur fuer die Neuanlage"},
+                "phone": {"type": "string", "description": "Telefon- oder Mobilnummer, nur fuer die Neuanlage"},
+                "note": {"type": "string", "description": "Notiz am Kunden, nur fuer die Neuanlage"},
                 "confirm": {"type": "boolean", "default": False, "description": "true = wirklich wechseln (und ggf. anlegen), sonst nur Vorschau"},
             }, "required": ["ticket_id", "customer"]},
         ),
         Tool(
             name="create_customer",
-            description="Neuen Kunden in Zammad anlegen (User mit Rolle Customer, andere Rollen sind nicht moeglich). Ohne confirm=true nur Vorschau der Daten, es wird nichts angelegt. Existiert die E-Mail schon (exakter Abgleich), wird nichts angelegt und der bestehende User zurueckgegeben (id, Name, E-Mail, aktiv). organization = Name einer bestehenden Organisation; unbekannte oder mehrdeutige Organisationen werden abgelehnt, es wird keine neue angelegt. Telefonnummern werden ins Format +41... gebracht (079 123 45 67, 044 123 45 67 oder international).",
+            description="Neuen Kunden in Zammad anlegen (User mit Rolle Customer, andere Rollen sind nicht moeglich). Ohne confirm=true nur Vorschau der Daten, es wird nichts angelegt. Existiert die E-Mail schon (exakter Abgleich), wird nichts angelegt und der bestehende User zurueckgegeben (id, Name, E-Mail, aktiv). organization = Name einer bestehenden Organisation; unbekannte oder mehrdeutige Organisationen werden abgelehnt, es wird keine neue angelegt. Telefonnummern werden ins Format +41... gebracht (079 123 45 67, 044 123 45 67 oder international); Schweizer Mobilnummern (+417...) landen im Feld mobile (fuer send_sms), alle anderen im Feld phone.",
             inputSchema={"type": "object", "properties": {
                 "email": {"type": "string"},
                 "firstname": {"type": "string"},

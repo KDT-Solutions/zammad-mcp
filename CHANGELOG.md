@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.33
+
+- `create_customer`: Schweizer Mobilnummern (+417...) werden im Feld `mobile` gespeichert (dort sucht `send_sms`), alle anderen Nummern im Feld `phone`.
+- `set_ticket_customer`: bei `create_if_missing=true` zusätzlich `organization`, `phone` und `note`, damit alle vorhandenen Angaben gleich beim Anlegen eingetragen werden. Die Vorschau zeigt die Organisation des neuen Kunden.
+
 ## 1.32
 
 - Neues Tool `create_customer`: legt einen Kunden an (Zammad-User mit Rolle Customer, andere Rollen sind weder per Parameter noch im Payload möglich). Ohne `confirm=true` nur Vorschau. Vorher wird per `users/search` exakt auf die E-Mail geprüft (case-insensitive); existiert der User, wird nichts angelegt und der bestehende User zurückgegeben (id, Name, E-Mail, aktiv). E-Mail-Format wird geprüft, Telefonnummern werden normalisiert (Schweizer 07x/0xx zu +41). `organization` wird nur auf eine bestehende Organisation aufgelöst, unbekannt oder mehrdeutig ist ein Fehler, es wird keine Organisation angelegt.
